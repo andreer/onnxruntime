@@ -329,6 +329,18 @@ TEST(GgufQuantPackedTest, MoEPackedCpuAndCudaAndHybridOffloadParity) {
     std::vector<std::unique_ptr<IExecutionProvider>> cpu_ep;
     cpu_ep.push_back(DefaultCpuExecutionProvider());
     tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &cpu_ep);
+
+#ifdef USE_CUDA
+    for (const char* gpu_exp : {"8", "4", "0"}) {
+      SessionOptions so;
+      ASSERT_STATUS_OK(so.config_options.AddConfigEntry("session.moe.offload.mode", "required"));
+      ASSERT_STATUS_OK(so.config_options.AddConfigEntry("session.moe.offload.placement", "static"));
+      ASSERT_STATUS_OK(so.config_options.AddConfigEntry("ep.cuda.moe_packed_gpu_experts", gpu_exp));
+      std::vector<std::unique_ptr<IExecutionProvider>> cuda_ep;
+      cuda_ep.push_back(DefaultCudaExecutionProvider());
+      tester.Run(so, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &cuda_ep);
+    }
+#endif
   }
 }
 

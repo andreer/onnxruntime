@@ -225,6 +225,7 @@ __global__ __launch_bounds__(512) void BuildMoEPackedTilesKernel(
     const int* __restrict__ topk_indices,
     int total_routes,
     int num_experts,
+    const int32_t* __restrict__ expert_to_slot,
     int* __restrict__ sorted_routes,
     MoEPackedTile* __restrict__ tiles,
     int* __restrict__ d_num_tiles) {
@@ -243,7 +244,9 @@ __global__ __launch_bounds__(512) void BuildMoEPackedTilesKernel(
   for (int r = tid; r < total_routes; r += 512) {
     const int e = topk_indices[r];
     if (static_cast<unsigned int>(e) < static_cast<unsigned int>(num_experts)) {
-      atomicAdd(&s_counts[e], 1);
+      if (expert_to_slot == nullptr || __ldg(&expert_to_slot[e]) >= 0) {
+        atomicAdd(&s_counts[e], 1);
+      }
     }
   }
   __syncthreads();
@@ -302,8 +305,10 @@ __global__ __launch_bounds__(512) void BuildMoEPackedTilesKernel(
   for (int r = tid; r < total_routes; r += 512) {
     const int e = topk_indices[r];
     if (static_cast<unsigned int>(e) < static_cast<unsigned int>(num_experts)) {
-      const int pos = atomicAdd(&s_cursor[e], 1);
-      sorted_routes[pos] = r;
+      if (expert_to_slot == nullptr || __ldg(&expert_to_slot[e]) >= 0) {
+        const int pos = atomicAdd(&s_cursor[e], 1);
+        sorted_routes[pos] = r;
+      }
     }
   }
 
@@ -354,6 +359,8 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
   const MoEPackedTile tile = tiles[tile_idx];
   const int count = tile.count;
   const int expert = tile.expert;
+  const int phys_slot = (p.expert_to_slot != nullptr) ? __ldg(&p.expert_to_slot[expert]) : expert;
+  if (phys_slot < 0) return;
 
   const int tid = static_cast<int>(threadIdx.x);
   if (tid < 8) {
@@ -388,7 +395,7 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
     const int j_out = cta_ch_base + m * 8 + g;
     valid_rows[m] = (j_out < p.inter_size);
     const int64_t exp_row_idx =
-        static_cast<int64_t>(expert) * p.inter_size + (valid_rows[m] ? j_out : 0);
+        static_cast<int64_t>(phys_slot) * p.inter_size + (valid_rows[m] ? j_out : 0);
     gate_ptrs[m] = gate_weights + exp_row_idx * p.gate_row_bytes;
     up_ptrs[m] = up_weights + exp_row_idx * p.up_row_bytes;
 #pragma unroll
@@ -495,6 +502,8 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
   const MoEPackedTile tile = tiles[tile_idx];
   const int count = tile.count;
   const int expert = tile.expert;
+  const int phys_slot = (p.expert_to_slot != nullptr) ? __ldg(&p.expert_to_slot[expert]) : expert;
+  if (phys_slot < 0) return;
   const int num_subtiles = (count + 7) >> 3;
   const int padded_routes = num_subtiles * 8;
 
@@ -531,7 +540,7 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
   const int j_out = (static_cast<int>(blockIdx.x) * kWarps + warp) * 8 + g;
   const bool valid_row = (j_out < p.inter_size);
 
-  const int64_t exp_row_idx = static_cast<int64_t>(expert) * p.inter_size + (valid_row ? j_out : 0);
+  const int64_t exp_row_idx = static_cast<int64_t>(phys_slot) * p.inter_size + (valid_row ? j_out : 0);
   const uint8_t* gate_row_ptr = gate_weights + exp_row_idx * p.gate_row_bytes;
   const uint8_t* up_row_ptr = up_weights + exp_row_idx * p.up_row_bytes;
 
@@ -653,6 +662,8 @@ __global__ __launch_bounds__(256) void MoEPackedFc2Bf16TcKernel(
   const MoEPackedTile tile = tiles[tile_idx];
   const int count = tile.count;
   const int expert = tile.expert;
+  const int phys_slot = (p.expert_to_slot != nullptr) ? __ldg(&p.expert_to_slot[expert]) : expert;
+  if (phys_slot < 0) return;
   const int num_subtiles = (count + 7) >> 3;
   const int padded_routes = num_subtiles * 8;
 
@@ -672,7 +683,7 @@ __global__ __launch_bounds__(256) void MoEPackedFc2Bf16TcKernel(
   const bool valid_lo = (r_lo < p.hidden_size);
   const bool valid_hi = (r_hi < p.hidden_size);
 
-  const int64_t exp_base = static_cast<int64_t>(expert) * p.hidden_size;
+  const int64_t exp_base = static_cast<int64_t>(phys_slot) * p.hidden_size;
   const uint8_t* down_row_lo = down_weights + (exp_base + (valid_lo ? r_lo : 0)) * p.down_row_bytes;
   const uint8_t* down_row_hi = down_weights + (exp_base + (valid_hi ? r_hi : 0)) * p.down_row_bytes;
 
@@ -781,6 +792,8 @@ __global__ __launch_bounds__(256) void MoEPackedFc1SwiGLUSimtKernel(
   const MoEPackedTile tile = tiles[tile_idx];
   const int count = tile.count < 8 ? tile.count : 8;
   const int expert = tile.expert;
+  const int phys_slot = (p.expert_to_slot != nullptr) ? __ldg(&p.expert_to_slot[expert]) : expert;
+  if (phys_slot < 0) return;
 
   if constexpr (kUseShared) {
     const int total_elems = count * p.hidden_size;
@@ -798,7 +811,7 @@ __global__ __launch_bounds__(256) void MoEPackedFc1SwiGLUSimtKernel(
   const int j_out = static_cast<int>(blockIdx.x) * 8 + warp;
   if (j_out >= p.inter_size) return;
 
-  const int64_t exp_row_idx = static_cast<int64_t>(expert) * p.inter_size + j_out;
+  const int64_t exp_row_idx = static_cast<int64_t>(phys_slot) * p.inter_size + j_out;
   const uint8_t* gate_row_ptr = gate_weights + exp_row_idx * p.gate_row_bytes;
   const uint8_t* up_row_ptr = up_weights + exp_row_idx * p.up_row_bytes;
 
@@ -878,6 +891,8 @@ __global__ __launch_bounds__(256) void MoEPackedFc2SimtKernel(
   const MoEPackedTile tile = tiles[tile_idx];
   const int count = tile.count < 8 ? tile.count : 8;
   const int expert = tile.expert;
+  const int phys_slot = (p.expert_to_slot != nullptr) ? __ldg(&p.expert_to_slot[expert]) : expert;
+  if (phys_slot < 0) return;
 
   if constexpr (kUseShared) {
     const int total_elems = count * p.inter_size;
@@ -894,7 +909,7 @@ __global__ __launch_bounds__(256) void MoEPackedFc2SimtKernel(
   const int n_out = static_cast<int>(blockIdx.x) * 8 + warp;
   if (n_out >= p.hidden_size) return;
 
-  const int64_t exp_row_idx = static_cast<int64_t>(expert) * p.hidden_size + n_out;
+  const int64_t exp_row_idx = static_cast<int64_t>(phys_slot) * p.hidden_size + n_out;
   const uint8_t* down_row_ptr = down_weights + exp_row_idx * p.down_row_bytes;
 
   float down_acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -1183,16 +1198,31 @@ void LaunchMoEPackedFc2Bf16TcDispatch(
 }
 
 template <typename CudaT>
-Status DispatchMoEPackedCuda(
+__global__ __launch_bounds__(256) void MoEPackedScatterColdFc2Kernel(
+    const CudaT* __restrict__ cold_fc2,
+    const int* __restrict__ cold_route_ids,
+    int num_cold_routes,
+    int hidden_size,
+    CudaT* __restrict__ fc2_out) {
+  const int c = static_cast<int>(blockIdx.y);
+  const int col = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+  if (c >= num_cold_routes || col >= hidden_size) return;
+  const int route_id = __ldg(cold_route_ids + c);
+  fc2_out[static_cast<int64_t>(route_id) * hidden_size + col] =
+      cold_fc2[static_cast<int64_t>(c) * hidden_size + col];
+}
+
+template <typename CudaT>
+Status DispatchMoEPackedRoutingCuda(
     cudaStream_t stream,
-    const CudaT* input,
     const CudaT* router_probs,
-    const uint8_t* gate_weights,
-    const uint8_t* up_weights,
-    const uint8_t* down_weights,
     const MoEPackedParams& params,
     void* workspace,
-    CudaT* output) {
+    float** out_d_topk_scales,
+    int** out_d_topk_indices,
+    void** out_d_fc2_out,
+    void** out_d_cold_fc2,
+    int** out_d_cold_route_ids) {
   ORT_RETURN_IF_NOT(params.num_rows >= 0 && params.num_rows <= kMoEPackedMaxChunkRows &&
                         params.hidden_size > 0 && params.hidden_size <= kMoEPackedMaxDimension &&
                         params.inter_size > 0 && params.inter_size <= kMoEPackedMaxDimension &&
@@ -1208,11 +1238,67 @@ Status DispatchMoEPackedCuda(
   const int max_tiles = use_prefill_tiles
                             ? ((total_routes + 31) / 32 + params.num_experts)
                             : ((total_routes <= 128) ? total_routes : ((total_routes + 7) / 8 + params.num_experts));
+
+  uint8_t* ws_ptr = static_cast<uint8_t*>(workspace);
+  float* topk_scales = reinterpret_cast<float*>(ws_ptr);
+  ws_ptr += AlignUpWorkspace(total_routes, sizeof(float));
+
+  int* topk_indices = reinterpret_cast<int*>(ws_ptr);
+  ws_ptr += AlignUpWorkspace(total_routes, sizeof(int));
+
+  ws_ptr += AlignUpWorkspace(total_routes, sizeof(int));
+  ws_ptr += AlignUpWorkspace(max_tiles, sizeof(MoEPackedTile));
+  ws_ptr += AlignUpWorkspace(sizeof(int));
+  ws_ptr += AlignUpWorkspace(SafeInt<size_t>(total_routes) * params.inter_size, sizeof(CudaT));
+
+  CudaT* fc2_out = reinterpret_cast<CudaT*>(ws_ptr);
+  ws_ptr += AlignUpWorkspace(SafeInt<size_t>(total_routes) * params.hidden_size, sizeof(CudaT));
+
+  CudaT* cold_fc2 = reinterpret_cast<CudaT*>(ws_ptr);
+  ws_ptr += AlignUpWorkspace(SafeInt<size_t>(total_routes) * params.hidden_size, sizeof(CudaT));
+
+  int* cold_route_ids = reinterpret_cast<int*>(ws_ptr);
+
+  if (out_d_topk_scales) *out_d_topk_scales = topk_scales;
+  if (out_d_topk_indices) *out_d_topk_indices = topk_indices;
+  if (out_d_fc2_out) *out_d_fc2_out = fc2_out;
+  if (out_d_cold_fc2) *out_d_cold_fc2 = cold_fc2;
+  if (out_d_cold_route_ids) *out_d_cold_route_ids = cold_route_ids;
+
+  const dim3 route_grid(static_cast<unsigned int>((params.num_rows + 7) / 8));
+  if (params.num_experts == 512) {
+    MoEPackedSoftmaxTopK512Kernel<CudaT><<<route_grid, 256, 0, stream>>>(
+        router_probs, topk_scales, topk_indices, params.num_rows, params.k, params.normalize_routing_weights);
+  } else {
+    MoEPackedSoftmaxTopKGenericKernel<CudaT><<<route_grid, 256, 0, stream>>>(
+        router_probs, topk_scales, topk_indices, params.num_rows, params.num_experts, params.k,
+        params.normalize_routing_weights);
+  }
+  return CUDA_CALL(cudaGetLastError());
+}
+
+template <typename CudaT>
+Status DispatchMoEPackedHotExpertsCuda(
+    cudaStream_t stream,
+    const CudaT* input,
+    const uint8_t* gate_weights,
+    const uint8_t* up_weights,
+    const uint8_t* down_weights,
+    const MoEPackedParams& params,
+    int resident_slots,
+    void* workspace) {
+  if (params.num_rows == 0 || resident_slots <= 0) return Status::OK();
+  const int total_routes = params.num_rows * params.k;
+  constexpr bool kIsBf16 = std::is_same<CudaT, __nv_bfloat16>::value;
+  const bool use_tensor_cores = kIsBf16 && params.bf16_tc_supported;
+  const bool use_prefill_tiles = use_tensor_cores && (total_routes > 128);
+  const int max_tiles = use_prefill_tiles
+                            ? ((total_routes + 31) / 32 + params.num_experts)
+                            : ((total_routes <= 128) ? total_routes : ((total_routes + 7) / 8 + params.num_experts));
   // Compact tile descriptors each contain at least one route. Keep workspace offsets unchanged.
   const int launch_tiles = std::min(max_tiles, total_routes);
 
   uint8_t* ws_ptr = static_cast<uint8_t*>(workspace);
-  float* topk_scales = reinterpret_cast<float*>(ws_ptr);
   ws_ptr += AlignUpWorkspace(total_routes, sizeof(float));
 
   int* topk_indices = reinterpret_cast<int*>(ws_ptr);
@@ -1232,25 +1318,13 @@ Status DispatchMoEPackedCuda(
 
   CudaT* fc2_out = reinterpret_cast<CudaT*>(ws_ptr);
 
-  // 1. Softmax + TopK
-  const dim3 route_grid(static_cast<unsigned int>((params.num_rows + 7) / 8));
-  if (params.num_experts == 512) {
-    MoEPackedSoftmaxTopK512Kernel<CudaT><<<route_grid, 256, 0, stream>>>(
-        router_probs, topk_scales, topk_indices, params.num_rows, params.k, params.normalize_routing_weights);
-  } else {
-    MoEPackedSoftmaxTopKGenericKernel<CudaT><<<route_grid, 256, 0, stream>>>(
-        router_probs, topk_scales, topk_indices, params.num_rows, params.num_experts, params.k,
-        params.normalize_routing_weights);
-  }
-  ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
-
   // 2. Build expert-grouped tiles (8 routes/tile in decode, 32 routes/tile in prefill)
   if (use_prefill_tiles) {
     BuildMoEPackedTilesKernel<32><<<1, 512, 0, stream>>>(
-        topk_indices, total_routes, params.num_experts, sorted_routes, tiles, d_num_tiles);
+        topk_indices, total_routes, params.num_experts, params.expert_to_slot, sorted_routes, tiles, d_num_tiles);
   } else {
     BuildMoEPackedTilesKernel<8><<<1, 512, 0, stream>>>(
-        topk_indices, total_routes, params.num_experts, sorted_routes, tiles, d_num_tiles);
+        topk_indices, total_routes, params.num_experts, params.expert_to_slot, sorted_routes, tiles, d_num_tiles);
   }
   ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
 
@@ -1308,6 +1382,28 @@ Status DispatchMoEPackedCuda(
     ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
   }
 
+  return Status::OK();
+}
+
+template <typename CudaT>
+Status DispatchMoEPackedScatterColdAndFinalizeCuda(
+    cudaStream_t stream,
+    const float* topk_scales,
+    const CudaT* d_cold_fc2,
+    const int* d_cold_route_ids,
+    int num_cold_routes,
+    const MoEPackedParams& params,
+    CudaT* fc2_out,
+    CudaT* output) {
+  if (params.num_rows == 0) return Status::OK();
+  if (num_cold_routes > 0) {
+    const dim3 scat_grid(static_cast<unsigned int>((params.hidden_size + 255) / 256),
+                         static_cast<unsigned int>(num_cold_routes));
+    MoEPackedScatterColdFc2Kernel<CudaT><<<scat_grid, 256, 0, stream>>>(
+        d_cold_fc2, d_cold_route_ids, num_cold_routes, params.hidden_size, fc2_out);
+    ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
+  }
+
   // IO-bound output may only be element-aligned.
   if ((params.hidden_size & 7) == 0 && (reinterpret_cast<uintptr_t>(output) & 15u) == 0) {
     const int vec_cols = params.hidden_size >> 3;
@@ -1322,6 +1418,27 @@ Status DispatchMoEPackedCuda(
         fc2_out, topk_scales, params.num_rows, params.hidden_size, params.k, output);
   }
   return CUDA_CALL(cudaGetLastError());
+}
+
+template <typename CudaT>
+Status DispatchMoEPackedCuda(
+    cudaStream_t stream,
+    const CudaT* input,
+    const CudaT* router_probs,
+    const uint8_t* gate_weights,
+    const uint8_t* up_weights,
+    const uint8_t* down_weights,
+    const MoEPackedParams& params,
+    void* workspace,
+    CudaT* output) {
+  float* topk_scales = nullptr;
+  void* fc2_out = nullptr;
+  ORT_RETURN_IF_ERROR(DispatchMoEPackedRoutingCuda<CudaT>(
+      stream, router_probs, params, workspace, &topk_scales, nullptr, &fc2_out, nullptr, nullptr));
+  ORT_RETURN_IF_ERROR(DispatchMoEPackedHotExpertsCuda<CudaT>(
+      stream, input, gate_weights, up_weights, down_weights, params, params.num_experts, workspace));
+  return DispatchMoEPackedScatterColdAndFinalizeCuda<CudaT>(
+      stream, topk_scales, nullptr, nullptr, 0, params, static_cast<CudaT*>(fc2_out), output);
 }
 
 }  // namespace
@@ -1357,7 +1474,9 @@ Status GetMoEPackedWorkspaceBytes(const MoEPackedParams& params, size_t elem_byt
                         add_buffer(max_tiles, sizeof(MoEPackedTile)) &&
                         add_buffer(1, sizeof(int)) &&
                         add_buffer(SafeInt<size_t>(total_routes) * params.inter_size, elem_bytes) &&
-                        add_buffer(SafeInt<size_t>(total_routes) * params.hidden_size, elem_bytes),
+                        add_buffer(SafeInt<size_t>(total_routes) * params.hidden_size, elem_bytes) &&
+                        add_buffer(SafeInt<size_t>(total_routes) * params.hidden_size, elem_bytes) &&
+                        add_buffer(total_routes, sizeof(int)),
                     "MoEPacked workspace byte size exceeds the supported address range");
   workspace_bytes = bytes;
   return Status::OK();
@@ -1401,6 +1520,69 @@ Status LaunchMoEPackedCuda(
   return DispatchMoEPackedCuda<half>(
       stream, static_cast<const half*>(input), static_cast<const half*>(router_probs),
       gate_weights, up_weights, down_weights, params, workspace, static_cast<half*>(output));
+}
+
+Status LaunchMoEPackedRoutingCuda(
+    cudaStream_t stream,
+    bool is_bf16,
+    const void* router_probs,
+    const MoEPackedParams& params,
+    void* workspace,
+    float** out_d_topk_scales,
+    int** out_d_topk_indices,
+    void** out_d_fc2_out,
+    void** out_d_cold_fc2,
+    int** out_d_cold_route_ids) {
+  if (is_bf16) {
+    return DispatchMoEPackedRoutingCuda<__nv_bfloat16>(
+        stream, static_cast<const __nv_bfloat16*>(router_probs), params, workspace,
+        out_d_topk_scales, out_d_topk_indices, out_d_fc2_out, out_d_cold_fc2, out_d_cold_route_ids);
+  }
+  return DispatchMoEPackedRoutingCuda<half>(
+      stream, static_cast<const half*>(router_probs), params, workspace,
+      out_d_topk_scales, out_d_topk_indices, out_d_fc2_out, out_d_cold_fc2, out_d_cold_route_ids);
+}
+
+Status LaunchMoEPackedHotExpertsCuda(
+    cudaStream_t stream,
+    bool is_bf16,
+    const void* input,
+    const uint8_t* gate_weights,
+    const uint8_t* up_weights,
+    const uint8_t* down_weights,
+    const MoEPackedParams& params,
+    int resident_slots,
+    void* workspace) {
+  if (is_bf16) {
+    return DispatchMoEPackedHotExpertsCuda<__nv_bfloat16>(
+        stream, static_cast<const __nv_bfloat16*>(input),
+        gate_weights, up_weights, down_weights, params, resident_slots, workspace);
+  }
+  return DispatchMoEPackedHotExpertsCuda<half>(
+      stream, static_cast<const half*>(input),
+      gate_weights, up_weights, down_weights, params, resident_slots, workspace);
+}
+
+Status LaunchMoEPackedScatterColdAndFinalizeCuda(
+    cudaStream_t stream,
+    bool is_bf16,
+    const float* d_topk_scales,
+    const void* d_cold_fc2,
+    const int* d_cold_route_ids,
+    int num_cold_routes,
+    const MoEPackedParams& params,
+    void* d_fc2_out,
+    void* output) {
+  if (is_bf16) {
+    return DispatchMoEPackedScatterColdAndFinalizeCuda<__nv_bfloat16>(
+        stream, d_topk_scales, static_cast<const __nv_bfloat16*>(d_cold_fc2),
+        d_cold_route_ids, num_cold_routes, params,
+        static_cast<__nv_bfloat16*>(d_fc2_out), static_cast<__nv_bfloat16*>(output));
+  }
+  return DispatchMoEPackedScatterColdAndFinalizeCuda<half>(
+      stream, d_topk_scales, static_cast<const half*>(d_cold_fc2),
+      d_cold_route_ids, num_cold_routes, params,
+      static_cast<half*>(d_fc2_out), static_cast<half*>(output));
 }
 
 }  // namespace cuda
