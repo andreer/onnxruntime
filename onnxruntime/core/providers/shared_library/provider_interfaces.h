@@ -37,6 +37,7 @@ namespace onnxruntime {
 // These types don't directly map to internal types
 struct ProviderHost;
 struct ProviderHostCPU;
+struct CapabilityPlanningInfo;
 
 class ExternalDataInfo;
 
@@ -1456,6 +1457,9 @@ struct ProviderHost {
 
   // Kernel pilot support — appended at end to preserve vtable ABI compatibility.
   virtual KernelPilot* OpKernelContext__GetKernelPilot(const OpKernelContext* p) = 0;
+
+  virtual void ComputeCapability__SetPlanning(
+      ComputeCapability* p, std::shared_ptr<const CapabilityPlanningInfo> planning) = 0;
 };
 
 #if defined(_MSC_VER) && !defined(__clang__)
