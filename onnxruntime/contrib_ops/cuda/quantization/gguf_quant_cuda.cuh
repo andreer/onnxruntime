@@ -25,10 +25,14 @@ __device__ __forceinline__ uint16_t ReadU16Dev(const uint8_t* p) {
 }
 
 __device__ __forceinline__ uint32_t ReadU32Dev(const uint8_t* p) {
-  if ((reinterpret_cast<uintptr_t>(p) & 3u) == 0) {
-    return __ldg(reinterpret_cast<const uint32_t*>(p));
+  if ((reinterpret_cast<uintptr_t>(p) & 1u) == 0) {
+    const auto* p16 = reinterpret_cast<const uint16_t*>(p);
+    return static_cast<uint32_t>(__ldg(p16)) | (static_cast<uint32_t>(__ldg(p16 + 1)) << 16);
   }
-  return static_cast<uint32_t>(ReadU16Dev(p)) | (static_cast<uint32_t>(ReadU16Dev(p + 2)) << 16);
+  return static_cast<uint32_t>(__ldg(p)) |
+         (static_cast<uint32_t>(__ldg(p + 1)) << 8) |
+         (static_cast<uint32_t>(__ldg(p + 2)) << 16) |
+         (static_cast<uint32_t>(__ldg(p + 3)) << 24);
 }
 
 // Tensor rows may be element-aligned without being aligned for a 128-bit load.
