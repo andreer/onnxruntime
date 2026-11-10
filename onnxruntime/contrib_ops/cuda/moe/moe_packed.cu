@@ -405,13 +405,16 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
   }
 
   const bool x_valid = (g < count);
+  const bool x_aligned = ((reinterpret_cast<uintptr_t>(input) & 15u) == 0);
   const __nv_bfloat16* x_row =
       input + static_cast<int64_t>(x_valid ? s_token_rows[g] : 0) * p.hidden_size;
 
   const int num_sb32 = p.hidden_size >> 5;
   for (int sb32_idx = warp; sb32_idx < num_sb32; sb32_idx += KW) {
+    const __nv_bfloat16* x_ptr = x_row + sb32_idx * 32 + t * 8;
     const uint4 b_vec = x_valid
-                            ? gguf_cuda::LoadU4Dev(x_row + sb32_idx * 32 + t * 8)
+                            ? (x_aligned ? __ldg(reinterpret_cast<const uint4*>(x_ptr))
+                                         : gguf_cuda::LoadU4Dev(x_ptr))
                             : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
@@ -638,9 +641,9 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
 
 // Tensor-Core BF16 FC2 kernel (mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32).
 // Each warp (32 threads) computes 16 hidden_size channels across up to kMaxSubTiles * 8 routes.
-// 8 warps per CTA = 128 hidden_size channels per CTA.
+// 4 warps per CTA (64 channels) in decode (kMaxSubTiles == 1), 8 warps per CTA (128 channels) in prefill.
 template <int kMaxSubTiles, int kDownType>
-__global__ __launch_bounds__(256) void MoEPackedFc2Bf16TcKernel(
+__global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2Bf16TcKernel(
     const __nv_bfloat16* __restrict__ fc1_out,
     const uint8_t* __restrict__ down_weights,
     const int* __restrict__ sorted_routes,
@@ -651,12 +654,26 @@ __global__ __launch_bounds__(256) void MoEPackedFc2Bf16TcKernel(
   const int tile_idx = static_cast<int>(blockIdx.y);
   if (tile_idx >= __ldg(d_num_tiles)) return;
 
+  constexpr int kWarps = (kMaxSubTiles == 1) ? 4 : 8;
+  constexpr int kThreads = kWarps * 32;
   constexpr int kChunkK = 640;
   constexpr int kChunkU4 = kChunkK / 8;         // 80
   constexpr int kRowStrideU4 = kChunkU4 + 4;    // 84 (bank-conflict-free for LDS.128)
   constexpr int kMaxRoutes = kMaxSubTiles * 8;  // 8 or 32
+  constexpr int kSmemActSize = (kMaxSubTiles == 1) ? 1 : (kMaxRoutes * kRowStrideU4);
+  using namespace onnxruntime::contrib::gguf_quant;
+  constexpr int kLutU64Count = (kMaxSubTiles != 1)
+                                   ? 1
+                                   : ((kDownType == kGgmlTypeIQ2_S)
+                                          ? 1024
+                                          : ((kDownType == kGgmlTypeIQ2_XS)
+                                                 ? 512
+                                                 : ((kDownType == kGgmlTypeIQ2_XXS)
+                                                        ? 256
+                                                        : ((kDownType == kGgmlTypeIQ3_XXS) ? 128 : 1))));
 
-  __shared__ uint4 s_act_u4[kMaxRoutes * kRowStrideU4];
+  __shared__ uint4 s_act_u4[kSmemActSize];
+  __shared__ uint64_t s_lut[kLutU64Count];
   __shared__ int s_routes[kMaxRoutes];
 
   const MoEPackedTile tile = tiles[tile_idx];
@@ -671,13 +688,25 @@ __global__ __launch_bounds__(256) void MoEPackedFc2Bf16TcKernel(
   if (tid < kMaxRoutes) {
     s_routes[tid] = (tid < count) ? __ldg(&sorted_routes[tile.start_route + tid]) : 0;
   }
+  if constexpr (kMaxSubTiles == 1) {
+    if constexpr (kDownType == kGgmlTypeIQ2_XXS) {
+      for (int i = tid; i < 256; i += kThreads) s_lut[i] = __ldg(iq2xxs_grid + i);
+    } else if constexpr (kDownType == kGgmlTypeIQ2_XS) {
+      for (int i = tid; i < 512; i += kThreads) s_lut[i] = __ldg(iq2xs_grid + i);
+    } else if constexpr (kDownType == kGgmlTypeIQ2_S) {
+      for (int i = tid; i < 1024; i += kThreads) s_lut[i] = __ldg(iq2s_grid + i);
+    } else if constexpr (kDownType == kGgmlTypeIQ3_XXS) {
+      uint32_t* s_lut32 = reinterpret_cast<uint32_t*>(s_lut);
+      for (int i = tid; i < 256; i += kThreads) s_lut32[i] = __ldg(iq3xxs_grid + i);
+    }
+  }
   __syncthreads();
 
   const int warp = tid >> 5;
   const int lane = tid & 31;
   const int g = lane >> 2;  // 0..7
   const int t = lane & 3;   // 0..3
-  const int n_out_base = (static_cast<int>(blockIdx.x) * 8 + warp) * 16;
+  const int n_out_base = (static_cast<int>(blockIdx.x) * kWarps + warp) * 16;
   const int r_lo = n_out_base + 2 * g;
   const int r_hi = r_lo + 1;
   const bool valid_lo = (r_lo < p.hidden_size);
@@ -696,54 +725,81 @@ __global__ __launch_bounds__(256) void MoEPackedFc2Bf16TcKernel(
     }
   }
 
-  for (int k_base = 0; k_base < p.inter_size; k_base += kChunkK) {
-    const int rem_k = p.inter_size - k_base;
-    const int actual_chunk_k = rem_k < kChunkK ? rem_k : kChunkK;
-    const int actual_chunk_u4 = actual_chunk_k >> 3;
-    const int total_u4 = padded_routes * actual_chunk_u4;
-
-    for (int idx = tid; idx < total_u4; idx += 256) {
-      const int m = idx / actual_chunk_u4;
-      const int u4_col = idx - m * actual_chunk_u4;
-      uint4 val = make_uint4(0u, 0u, 0u, 0u);
-      if (m < count) {
-        const int route = s_routes[m];
-        const __nv_bfloat16* src_ptr =
-            fc1_out + static_cast<int64_t>(route) * p.inter_size + k_base + (u4_col << 3);
-        val = __ldg(reinterpret_cast<const uint4*>(src_ptr));
-      }
-      s_act_u4[m * kRowStrideU4 + u4_col] = val;
-    }
-    __syncthreads();
-
+  if constexpr (kMaxSubTiles == 1) {
     if (valid_lo) {
-      const int sb32_base = k_base >> 5;
-      const int num_sb32 = actual_chunk_k >> 5;
-      for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
-        const int sb32_idx = sb32_base + sb_local;
+      const bool route_valid = (g < count);
+      const __nv_bfloat16* fc1_row =
+          fc1_out + static_cast<int64_t>(route_valid ? s_routes[g] : 0) * p.inter_size;
+      const int num_sb32 = p.inter_size >> 5;
+      for (int sb32_idx = 0; sb32_idx < num_sb32; ++sb32_idx) {
+        const uint4 b_vec = route_valid
+                                ? __ldg(reinterpret_cast<const uint4*>(fc1_row + sb32_idx * 32 + t * 8))
+                                : make_uint4(0u, 0u, 0u, 0u);
         float d_lo[8];
         float d_hi[8];
-        gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, d_lo);
+        gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, s_lut, d_lo);
         if (valid_hi) {
-          gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_hi, p.down_type, sb32_idx, t, d_hi);
+          gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kDownType>(down_row_hi, p.down_type, sb32_idx, t, s_lut, d_hi);
         } else {
 #pragma unroll
           for (int j = 0; j < 8; ++j) d_hi[j] = 0.0f;
         }
         const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
         const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
+        gguf_cuda::MmaBf16(acc[0], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+        gguf_cuda::MmaBf16(acc[0], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+      }
+    }
+  } else {
+    for (int k_base = 0; k_base < p.inter_size; k_base += kChunkK) {
+      const int rem_k = p.inter_size - k_base;
+      const int actual_chunk_k = rem_k < kChunkK ? rem_k : kChunkK;
+      const int actual_chunk_u4 = actual_chunk_k >> 3;
+      const int total_u4 = padded_routes * actual_chunk_u4;
+
+      for (int idx = tid; idx < total_u4; idx += kThreads) {
+        const int m = idx / actual_chunk_u4;
+        const int u4_col = idx - m * actual_chunk_u4;
+        uint4 val = make_uint4(0u, 0u, 0u, 0u);
+        if (m < count) {
+          const int route = s_routes[m];
+          const __nv_bfloat16* src_ptr =
+              fc1_out + static_cast<int64_t>(route) * p.inter_size + k_base + (u4_col << 3);
+          val = __ldg(reinterpret_cast<const uint4*>(src_ptr));
+        }
+        s_act_u4[m * kRowStrideU4 + u4_col] = val;
+      }
+      __syncthreads();
+
+      if (valid_lo) {
+        const int sb32_base = k_base >> 5;
+        const int num_sb32 = actual_chunk_k >> 5;
+        for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
+          const int sb32_idx = sb32_base + sb_local;
+          float d_lo[8];
+          float d_hi[8];
+          gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, d_lo);
+          if (valid_hi) {
+            gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_hi, p.down_type, sb32_idx, t, d_hi);
+          } else {
 #pragma unroll
-        for (int st = 0; st < kMaxSubTiles; ++st) {
-          if (st < num_subtiles) {
-            const uint4 b_vec = s_act_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
-            gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-            gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+            for (int j = 0; j < 8; ++j) d_hi[j] = 0.0f;
+          }
+          const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
+          const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
+#pragma unroll
+          for (int st = 0; st < kMaxSubTiles; ++st) {
+            if (st < num_subtiles) {
+              const uint4 b_vec = s_act_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
+              gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+              gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+            }
           }
         }
       }
-    }
-    if (k_base + kChunkK < p.inter_size) {
-      __syncthreads();
+      if (k_base + kChunkK < p.inter_size) {
+        __syncthreads();
+      }
     }
   }
 
@@ -1153,45 +1209,46 @@ void LaunchMoEPackedFc2Bf16TcDispatch(
     const MoEPackedParams& params,
     __nv_bfloat16* fc2_out) {
   using namespace onnxruntime::contrib::gguf_quant;
+  constexpr unsigned int kBlock = (kMaxSubTiles == 1) ? 128u : 256u;
   switch (params.down_type) {
     case kGgmlTypeQ2_0:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ2_0><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ2_0><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeIQ4_NL:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ4_NL><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ4_NL><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeQ5_0:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ5_0><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ5_0><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeIQ2_XXS:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ2_XXS><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ2_XXS><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeIQ2_XS:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ2_XS><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ2_XS><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeIQ2_S:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ2_S><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ2_S><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeIQ3_XXS:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ3_XXS><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ3_XXS><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeIQ4_XS:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ4_XS><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeIQ4_XS><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     case kGgmlTypeQ8_0:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ8_0><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ8_0><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
     default:
-      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, -1><<<grid, 256, 0, stream>>>(
+      MoEPackedFc2Bf16TcKernel<kMaxSubTiles, -1><<<grid, kBlock, 0, stream>>>(
           fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       return;
   }
@@ -1344,13 +1401,15 @@ Status DispatchMoEPackedHotExpertsCuda(
       }
       ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
 
-      // 4. Tensor-Core FC2 (128 hidden_size channels per CTA)
-      const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 127) / 128),
-                          static_cast<unsigned int>(launch_tiles));
+      // 4. Tensor-Core FC2 (128 hidden_size channels/CTA in prefill, 64 hidden_size channels/CTA in decode)
       if (use_prefill_tiles) {
+        const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 127) / 128),
+                            static_cast<unsigned int>(launch_tiles));
         LaunchMoEPackedFc2Bf16TcDispatch<4>(
             stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       } else {
+        const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 63) / 64),
+                            static_cast<unsigned int>(launch_tiles));
         LaunchMoEPackedFc2Bf16TcDispatch<1>(
             stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
       }

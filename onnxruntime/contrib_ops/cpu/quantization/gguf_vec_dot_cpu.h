@@ -1057,6 +1057,117 @@ __attribute__((target("avx2,fma,f16c"))) inline void AccumIq4Nl32Q8Avx2(
   acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(scale_f32), acc);
 }
 
+__attribute__((target("avx2,fma,f16c"))) inline void AccumIq2Xxs32Q8Batch2Avx2(
+    const uint8_t* aux8,
+    float d_a, __m256i x_qa, __m256& acc_a,
+    float d_b, __m256i x_qb, __m256& acc_b) noexcept {
+  const uint32_t aux32 = ReadU32Le(aux8 + 4);
+  const __m256i grid_u8 = _mm256_set_epi64x(
+      static_cast<int64_t>(iq2xxs_grid[aux8[3]]),
+      static_cast<int64_t>(iq2xxs_grid[aux8[2]]),
+      static_cast<int64_t>(iq2xxs_grid[aux8[1]]),
+      static_cast<int64_t>(iq2xxs_grid[aux8[0]]));
+  const __m256i signs = _mm256_set_epi64x(
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 21) & 127u]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 14) & 127u]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 7) & 127u]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 0) & 127u]));
+  const __m256i ls_v = _mm256_set1_epi16(static_cast<int16_t>(2 * (aux32 >> 28) + 1));
+  const __m256i p32_a = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qa, signs)), ls_v);
+  const __m256i p32_b = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qb, signs)), ls_v);
+  acc_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_a), _mm256_set1_ps(d_a), acc_a);
+  acc_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_b), _mm256_set1_ps(d_b), acc_b);
+}
+
+__attribute__((target("avx2,fma,f16c"))) inline void AccumIq2Xs32Q8Batch2Avx2(
+    const uint8_t* qs_ib, uint8_t sc,
+    float d_a, __m256i x_qa, __m256& acc_a,
+    float d_b, __m256i x_qb, __m256& acc_b) noexcept {
+  const uint16_t q0 = ReadU16Le(qs_ib + 0);
+  const uint16_t q1 = ReadU16Le(qs_ib + 2);
+  const uint16_t q2 = ReadU16Le(qs_ib + 4);
+  const uint16_t q3 = ReadU16Le(qs_ib + 6);
+  const __m256i grid_u8 = _mm256_set_epi64x(
+      static_cast<int64_t>(iq2xs_grid[q3 & 511u]),
+      static_cast<int64_t>(iq2xs_grid[q2 & 511u]),
+      static_cast<int64_t>(iq2xs_grid[q1 & 511u]),
+      static_cast<int64_t>(iq2xs_grid[q0 & 511u]));
+  const __m256i signs = _mm256_set_epi64x(
+      static_cast<int64_t>(kSignBytes7Bit.mask[q3 >> 9]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[q2 >> 9]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[q1 >> 9]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[q0 >> 9]));
+  const __m256i ls_v = _mm256_set_m128i(
+      _mm_set1_epi16(static_cast<int16_t>(2 * (sc >> 4) + 1)),
+      _mm_set1_epi16(static_cast<int16_t>(2 * (sc & 0xF) + 1)));
+  const __m256i p32_a = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qa, signs)), ls_v);
+  const __m256i p32_b = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qb, signs)), ls_v);
+  acc_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_a), _mm256_set1_ps(d_a), acc_a);
+  acc_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_b), _mm256_set1_ps(d_b), acc_b);
+}
+
+__attribute__((target("avx2,fma,f16c"))) inline void AccumIq2S32Q8Batch2Avx2(
+    const uint8_t* qs_ib, const uint8_t* signs_ib, uint32_t qh_b, uint8_t sc,
+    float d_a, __m256i x_qa, __m256& acc_a,
+    float d_b, __m256i x_qb, __m256& acc_b) noexcept {
+  const __m256i grid_u8 = _mm256_set_epi64x(
+      static_cast<int64_t>(iq2s_grid[qs_ib[3] | ((qh_b << 2) & 0x300u)]),
+      static_cast<int64_t>(iq2s_grid[qs_ib[2] | ((qh_b << 4) & 0x300u)]),
+      static_cast<int64_t>(iq2s_grid[qs_ib[1] | ((qh_b << 6) & 0x300u)]),
+      static_cast<int64_t>(iq2s_grid[qs_ib[0] | ((qh_b << 8) & 0x300u)]));
+  const __m256i signs = _mm256_set_epi64x(
+      static_cast<int64_t>(kSignBytes8Bit.mask[signs_ib[3]]),
+      static_cast<int64_t>(kSignBytes8Bit.mask[signs_ib[2]]),
+      static_cast<int64_t>(kSignBytes8Bit.mask[signs_ib[1]]),
+      static_cast<int64_t>(kSignBytes8Bit.mask[signs_ib[0]]));
+  const __m256i ls_v = _mm256_set_m128i(
+      _mm_set1_epi16(static_cast<int16_t>(2 * (sc >> 4) + 1)),
+      _mm_set1_epi16(static_cast<int16_t>(2 * (sc & 0xF) + 1)));
+  const __m256i p32_a = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qa, signs)), ls_v);
+  const __m256i p32_b = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qb, signs)), ls_v);
+  acc_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_a), _mm256_set1_ps(d_a), acc_a);
+  acc_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_b), _mm256_set1_ps(d_b), acc_b);
+}
+
+__attribute__((target("avx2,fma,f16c"))) inline void AccumIq3Xxs32Q8Batch2Avx2(
+    const uint8_t* qs_ib, uint32_t aux32,
+    float d_a, __m256i x_qa, __m256& acc_a,
+    float d_b, __m256i x_qb, __m256& acc_b) noexcept {
+  const __m256i grid_u8 = _mm256_setr_epi32(
+      static_cast<int>(iq3xxs_grid[qs_ib[0]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[1]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[2]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[3]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[4]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[5]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[6]]),
+      static_cast<int>(iq3xxs_grid[qs_ib[7]]));
+  const __m256i signs = _mm256_set_epi64x(
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 21) & 127u]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 14) & 127u]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 7) & 127u]),
+      static_cast<int64_t>(kSignBytes7Bit.mask[(aux32 >> 0) & 127u]));
+  const __m256i ls_v = _mm256_set1_epi16(static_cast<int16_t>(2 * (aux32 >> 28) + 1));
+  const __m256i p32_a = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qa, signs)), ls_v);
+  const __m256i p32_b = _mm256_madd_epi16(_mm256_maddubs_epi16(grid_u8, _mm256_sign_epi8(x_qb, signs)), ls_v);
+  acc_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_a), _mm256_set1_ps(d_a), acc_a);
+  acc_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_b), _mm256_set1_ps(d_b), acc_b);
+}
+
+__attribute__((target("avx2,fma,f16c"))) inline void AccumIq4Nl32Q8Batch2Avx2(
+    const uint8_t* qs16, __m256i lut_iq4nl_256, __m256i mask4_256, int16_t sub_scale_i16,
+    __m256i ax_a, __m256i x_qa, float scale_a, __m256& acc_a,
+    __m256i ax_b, __m256i x_qb, float scale_b, __m256& acc_b) noexcept {
+  const __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs16));
+  const __m256i nibbles = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw16, 4), raw16), mask4_256);
+  const __m256i w_i8 = _mm256_shuffle_epi8(lut_iq4nl_256, nibbles);
+  const __m256i ls_v = _mm256_set1_epi16(sub_scale_i16);
+  const __m256i p32_a = _mm256_madd_epi16(_mm256_maddubs_epi16(ax_a, _mm256_sign_epi8(w_i8, x_qa)), ls_v);
+  const __m256i p32_b = _mm256_madd_epi16(_mm256_maddubs_epi16(ax_b, _mm256_sign_epi8(w_i8, x_qb)), ls_v);
+  acc_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_a), _mm256_set1_ps(scale_a), acc_a);
+  acc_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_b), _mm256_set1_ps(scale_b), acc_b);
+}
+
 __attribute__((target("avx2,fma,f16c"))) inline __m256i UnpackQ2_0_32Avx2(
     const uint8_t* qs8, __m256i mask2_256) noexcept {
   const __m256i v0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs8)));
@@ -1811,6 +1922,296 @@ __attribute__((target("avx2,fma,f16c"))) inline void VecDotGgufRow4xQ8Avx2(
   }
 }
 
+__attribute__((target("avx2,fma,f16c"))) inline void VecDotGgufRow4xQ8Batch2Avx2(
+    int quant_type,
+    const uint8_t* row0,
+    const uint8_t* row1,
+    const uint8_t* row2,
+    const uint8_t* row3,
+    const GgufQ8Block* x_qa,
+    const GgufQ8Block* x_qb,
+    int64_t K,
+    float* out4_a,
+    float* out4_b) {
+  __m256 acc0_a = _mm256_setzero_ps();
+  __m256 acc1_a = _mm256_setzero_ps();
+  __m256 acc2_a = _mm256_setzero_ps();
+  __m256 acc3_a = _mm256_setzero_ps();
+  __m256 acc0_b = _mm256_setzero_ps();
+  __m256 acc1_b = _mm256_setzero_ps();
+  __m256 acc2_b = _mm256_setzero_ps();
+  __m256 acc3_b = _mm256_setzero_ps();
+
+  switch (quant_type) {
+    case kGgmlTypeIQ2_XXS: {
+      const int64_t nb = K / 256;
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 66;
+        const uint8_t* b1 = row1 + i * 66;
+        const uint8_t* b2 = row2 + i * 66;
+        const uint8_t* b3 = row3 + i * 66;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0)) * 0.125f;
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1)) * 0.125f;
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2)) * 0.125f;
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3)) * 0.125f;
+        const GgufQ8Block* qa = x_qa + i * 8;
+        const GgufQ8Block* qb = x_qb + i * 8;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+          const float qda = qa[ib32].d;
+          const float qdb = qb[ib32].d;
+          const __m256i x_qa_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa[ib32].qs));
+          const __m256i x_qb_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb[ib32].qs));
+          AccumIq2Xxs32Q8Batch2Avx2(b0 + 2 + 8 * ib32, d0 * qda, x_qa_32, acc0_a, d0 * qdb, x_qb_32, acc0_b);
+          AccumIq2Xxs32Q8Batch2Avx2(b1 + 2 + 8 * ib32, d1 * qda, x_qa_32, acc1_a, d1 * qdb, x_qb_32, acc1_b);
+          AccumIq2Xxs32Q8Batch2Avx2(b2 + 2 + 8 * ib32, d2 * qda, x_qa_32, acc2_a, d2 * qdb, x_qb_32, acc2_b);
+          AccumIq2Xxs32Q8Batch2Avx2(b3 + 2 + 8 * ib32, d3 * qda, x_qa_32, acc3_a, d3 * qdb, x_qb_32, acc3_b);
+        }
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      return;
+    }
+    case kGgmlTypeIQ2_XS: {
+      const int64_t nb = K / 256;
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 74;
+        const uint8_t* b1 = row1 + i * 74;
+        const uint8_t* b2 = row2 + i * 74;
+        const uint8_t* b3 = row3 + i * 74;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0)) * 0.125f;
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1)) * 0.125f;
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2)) * 0.125f;
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3)) * 0.125f;
+        const GgufQ8Block* qa = x_qa + i * 8;
+        const GgufQ8Block* qb = x_qb + i * 8;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+          const float qda = qa[ib32].d;
+          const float qdb = qb[ib32].d;
+          const __m256i x_qa_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa[ib32].qs));
+          const __m256i x_qb_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb[ib32].qs));
+          AccumIq2Xs32Q8Batch2Avx2(b0 + 2 + 8 * ib32, b0[66 + ib32], d0 * qda, x_qa_32, acc0_a, d0 * qdb, x_qb_32, acc0_b);
+          AccumIq2Xs32Q8Batch2Avx2(b1 + 2 + 8 * ib32, b1[66 + ib32], d1 * qda, x_qa_32, acc1_a, d1 * qdb, x_qb_32, acc1_b);
+          AccumIq2Xs32Q8Batch2Avx2(b2 + 2 + 8 * ib32, b2[66 + ib32], d2 * qda, x_qa_32, acc2_a, d2 * qdb, x_qb_32, acc2_b);
+          AccumIq2Xs32Q8Batch2Avx2(b3 + 2 + 8 * ib32, b3[66 + ib32], d3 * qda, x_qa_32, acc3_a, d3 * qdb, x_qb_32, acc3_b);
+        }
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      return;
+    }
+    case kGgmlTypeIQ2_S: {
+      const int64_t nb = K / 256;
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 82;
+        const uint8_t* b1 = row1 + i * 82;
+        const uint8_t* b2 = row2 + i * 82;
+        const uint8_t* b3 = row3 + i * 82;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0)) * 0.125f;
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1)) * 0.125f;
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2)) * 0.125f;
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3)) * 0.125f;
+        const GgufQ8Block* qa = x_qa + i * 8;
+        const GgufQ8Block* qb = x_qb + i * 8;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+          const float qda = qa[ib32].d;
+          const float qdb = qb[ib32].d;
+          const __m256i x_qa_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa[ib32].qs));
+          const __m256i x_qb_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb[ib32].qs));
+          AccumIq2S32Q8Batch2Avx2(
+              b0 + 2 + 4 * ib32, b0 + 34 + 4 * ib32, b0[66 + ib32], b0[74 + ib32],
+              d0 * qda, x_qa_32, acc0_a, d0 * qdb, x_qb_32, acc0_b);
+          AccumIq2S32Q8Batch2Avx2(
+              b1 + 2 + 4 * ib32, b1 + 34 + 4 * ib32, b1[66 + ib32], b1[74 + ib32],
+              d1 * qda, x_qa_32, acc1_a, d1 * qdb, x_qb_32, acc1_b);
+          AccumIq2S32Q8Batch2Avx2(
+              b2 + 2 + 4 * ib32, b2 + 34 + 4 * ib32, b2[66 + ib32], b2[74 + ib32],
+              d2 * qda, x_qa_32, acc2_a, d2 * qdb, x_qb_32, acc2_b);
+          AccumIq2S32Q8Batch2Avx2(
+              b3 + 2 + 4 * ib32, b3 + 34 + 4 * ib32, b3[66 + ib32], b3[74 + ib32],
+              d3 * qda, x_qa_32, acc3_a, d3 * qdb, x_qb_32, acc3_b);
+        }
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      return;
+    }
+    case kGgmlTypeIQ3_XXS: {
+      const int64_t nb = K / 256;
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 98;
+        const uint8_t* b1 = row1 + i * 98;
+        const uint8_t* b2 = row2 + i * 98;
+        const uint8_t* b3 = row3 + i * 98;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0)) * 0.25f;
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1)) * 0.25f;
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2)) * 0.25f;
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3)) * 0.25f;
+        const GgufQ8Block* qa = x_qa + i * 8;
+        const GgufQ8Block* qb = x_qb + i * 8;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+          const float qda = qa[ib32].d;
+          const float qdb = qb[ib32].d;
+          const __m256i x_qa_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa[ib32].qs));
+          const __m256i x_qb_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb[ib32].qs));
+          AccumIq3Xxs32Q8Batch2Avx2(
+              b0 + 2 + 8 * ib32, ReadU32Le(b0 + 66 + 4 * ib32),
+              d0 * qda, x_qa_32, acc0_a, d0 * qdb, x_qb_32, acc0_b);
+          AccumIq3Xxs32Q8Batch2Avx2(
+              b1 + 2 + 8 * ib32, ReadU32Le(b1 + 66 + 4 * ib32),
+              d1 * qda, x_qa_32, acc1_a, d1 * qdb, x_qb_32, acc1_b);
+          AccumIq3Xxs32Q8Batch2Avx2(
+              b2 + 2 + 8 * ib32, ReadU32Le(b2 + 66 + 4 * ib32),
+              d2 * qda, x_qa_32, acc2_a, d2 * qdb, x_qb_32, acc2_b);
+          AccumIq3Xxs32Q8Batch2Avx2(
+              b3 + 2 + 8 * ib32, ReadU32Le(b3 + 66 + 4 * ib32),
+              d3 * qda, x_qa_32, acc3_a, d3 * qdb, x_qb_32, acc3_b);
+        }
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      return;
+    }
+    case kGgmlTypeIQ4_NL: {
+      const int64_t nb = K / 32;
+      const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+      const __m256i lut_256 = _mm256_set_m128i(lut128, lut128);
+      const __m256i mask4_256 = _mm256_set1_epi8(0x0F);
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 18;
+        const uint8_t* b1 = row1 + i * 18;
+        const uint8_t* b2 = row2 + i * 18;
+        const uint8_t* b3 = row3 + i * 18;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0));
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1));
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2));
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3));
+        const float qda = x_qa[i].d;
+        const float qdb = x_qb[i].d;
+        const __m256i x_qa_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qa[i].qs));
+        const __m256i x_qb_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qb[i].qs));
+        const __m256i ax_a = _mm256_abs_epi8(x_qa_32);
+        const __m256i ax_b = _mm256_abs_epi8(x_qb_32);
+        AccumIq4Nl32Q8Batch2Avx2(b0 + 2, lut_256, mask4_256, 1, ax_a, x_qa_32, d0 * qda, acc0_a, ax_b, x_qb_32, d0 * qdb, acc0_b);
+        AccumIq4Nl32Q8Batch2Avx2(b1 + 2, lut_256, mask4_256, 1, ax_a, x_qa_32, d1 * qda, acc1_a, ax_b, x_qb_32, d1 * qdb, acc1_b);
+        AccumIq4Nl32Q8Batch2Avx2(b2 + 2, lut_256, mask4_256, 1, ax_a, x_qa_32, d2 * qda, acc2_a, ax_b, x_qb_32, d2 * qdb, acc2_b);
+        AccumIq4Nl32Q8Batch2Avx2(b3 + 2, lut_256, mask4_256, 1, ax_a, x_qa_32, d3 * qda, acc3_a, ax_b, x_qb_32, d3 * qdb, acc3_b);
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      return;
+    }
+    case kGgmlTypeIQ4_XS: {
+      const int64_t nb = K / 256;
+      const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+      const __m256i lut_256 = _mm256_set_m128i(lut128, lut128);
+      const __m256i mask4_256 = _mm256_set1_epi8(0x0F);
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 136;
+        const uint8_t* b1 = row1 + i * 136;
+        const uint8_t* b2 = row2 + i * 136;
+        const uint8_t* b3 = row3 + i * 136;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0));
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1));
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2));
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3));
+        const uint16_t sh0 = ReadU16Le(b0 + 2);
+        const uint16_t sh1 = ReadU16Le(b1 + 2);
+        const uint16_t sh2 = ReadU16Le(b2 + 2);
+        const uint16_t sh3 = ReadU16Le(b3 + 2);
+        const GgufQ8Block* qa = x_qa + i * 8;
+        const GgufQ8Block* qb = x_qb + i * 8;
+        for (int ib = 0; ib < 8; ++ib) {
+          const int ls0 = ((b0[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh0 >> (2 * ib)) & 3) << 4);
+          const int ls1 = ((b1[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh1 >> (2 * ib)) & 3) << 4);
+          const int ls2 = ((b2[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh2 >> (2 * ib)) & 3) << 4);
+          const int ls3 = ((b3[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh3 >> (2 * ib)) & 3) << 4);
+          const float qda = qa[ib].d;
+          const float qdb = qb[ib].d;
+          const __m256i x_qa_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa[ib].qs));
+          const __m256i x_qb_32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb[ib].qs));
+          const __m256i ax_a = _mm256_abs_epi8(x_qa_32);
+          const __m256i ax_b = _mm256_abs_epi8(x_qb_32);
+          AccumIq4Nl32Q8Batch2Avx2(b0 + 8 + ib * 16, lut_256, mask4_256, static_cast<int16_t>(ls0 - 32), ax_a, x_qa_32, d0 * qda, acc0_a, ax_b, x_qb_32, d0 * qdb, acc0_b);
+          AccumIq4Nl32Q8Batch2Avx2(b1 + 8 + ib * 16, lut_256, mask4_256, static_cast<int16_t>(ls1 - 32), ax_a, x_qa_32, d1 * qda, acc1_a, ax_b, x_qb_32, d1 * qdb, acc1_b);
+          AccumIq4Nl32Q8Batch2Avx2(b2 + 8 + ib * 16, lut_256, mask4_256, static_cast<int16_t>(ls2 - 32), ax_a, x_qa_32, d2 * qda, acc2_a, ax_b, x_qb_32, d2 * qdb, acc2_b);
+          AccumIq4Nl32Q8Batch2Avx2(b3 + 8 + ib * 16, lut_256, mask4_256, static_cast<int16_t>(ls3 - 32), ax_a, x_qa_32, d3 * qda, acc3_a, ax_b, x_qb_32, d3 * qdb, acc3_b);
+        }
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      return;
+    }
+    case kGgmlTypeQ2_0: {
+      const int64_t nb = K / 64;
+      const __m256i mask2_256 = _mm256_set1_epi8(0x03);
+      const __m256i ones_16 = _mm256_set1_epi16(1);
+      __m128 bsum_acc4_a = _mm_setzero_ps();
+      __m128 bsum_acc4_b = _mm_setzero_ps();
+      for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b0 = row0 + i * 18;
+        const uint8_t* b1 = row1 + i * 18;
+        const uint8_t* b2 = row2 + i * 18;
+        const uint8_t* b3 = row3 + i * 18;
+        const float d0 = Fp16BitsToFloatCpu(ReadU16Le(b0));
+        const float d1 = Fp16BitsToFloatCpu(ReadU16Le(b1));
+        const float d2 = Fp16BitsToFloatCpu(ReadU16Le(b2));
+        const float d3 = Fp16BitsToFloatCpu(ReadU16Le(b3));
+        const __m128 d4_v = _mm_setr_ps(d0, d1, d2, d3);
+
+        const GgufQ8Block& qa_0 = x_qa[2 * i + 0];
+        const GgufQ8Block& qa_1 = x_qa[2 * i + 1];
+        const GgufQ8Block& qb_0 = x_qb[2 * i + 0];
+        const GgufQ8Block& qb_1 = x_qb[2 * i + 1];
+        const __m256i x_qa0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa_0.qs));
+        const __m256i x_qa1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa_1.qs));
+        const __m256i x_qb0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb_0.qs));
+        const __m256i x_qb1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qb_1.qs));
+
+        const __m256i u0_0 = UnpackQ2_0_32Avx2(b0 + 2, mask2_256);
+        const __m256i u1_0 = UnpackQ2_0_32Avx2(b1 + 2, mask2_256);
+        const __m256i u2_0 = UnpackQ2_0_32Avx2(b2 + 2, mask2_256);
+        const __m256i u3_0 = UnpackQ2_0_32Avx2(b3 + 2, mask2_256);
+        acc0_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u0_0, x_qa0), ones_16)), _mm256_set1_ps(d0 * qa_0.d), acc0_a);
+        acc1_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u1_0, x_qa0), ones_16)), _mm256_set1_ps(d1 * qa_0.d), acc1_a);
+        acc2_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u2_0, x_qa0), ones_16)), _mm256_set1_ps(d2 * qa_0.d), acc2_a);
+        acc3_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u3_0, x_qa0), ones_16)), _mm256_set1_ps(d3 * qa_0.d), acc3_a);
+        acc0_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u0_0, x_qb0), ones_16)), _mm256_set1_ps(d0 * qb_0.d), acc0_b);
+        acc1_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u1_0, x_qb0), ones_16)), _mm256_set1_ps(d1 * qb_0.d), acc1_b);
+        acc2_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u2_0, x_qb0), ones_16)), _mm256_set1_ps(d2 * qb_0.d), acc2_b);
+        acc3_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u3_0, x_qb0), ones_16)), _mm256_set1_ps(d3 * qb_0.d), acc3_b);
+
+        const __m256i u0_1 = UnpackQ2_0_32Avx2(b0 + 10, mask2_256);
+        const __m256i u1_1 = UnpackQ2_0_32Avx2(b1 + 10, mask2_256);
+        const __m256i u2_1 = UnpackQ2_0_32Avx2(b2 + 10, mask2_256);
+        const __m256i u3_1 = UnpackQ2_0_32Avx2(b3 + 10, mask2_256);
+        acc0_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u0_1, x_qa1), ones_16)), _mm256_set1_ps(d0 * qa_1.d), acc0_a);
+        acc1_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u1_1, x_qa1), ones_16)), _mm256_set1_ps(d1 * qa_1.d), acc1_a);
+        acc2_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u2_1, x_qa1), ones_16)), _mm256_set1_ps(d2 * qa_1.d), acc2_a);
+        acc3_a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u3_1, x_qa1), ones_16)), _mm256_set1_ps(d3 * qa_1.d), acc3_a);
+        acc0_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u0_1, x_qb1), ones_16)), _mm256_set1_ps(d0 * qb_1.d), acc0_b);
+        acc1_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u1_1, x_qb1), ones_16)), _mm256_set1_ps(d1 * qb_1.d), acc1_b);
+        acc2_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u2_1, x_qb1), ones_16)), _mm256_set1_ps(d2 * qb_1.d), acc2_b);
+        acc3_b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u3_1, x_qb1), ones_16)), _mm256_set1_ps(d3 * qb_1.d), acc3_b);
+
+        const float qba = qa_0.d * static_cast<float>(qa_0.bsum) + qa_1.d * static_cast<float>(qa_1.bsum);
+        const float qbb = qb_0.d * static_cast<float>(qb_0.bsum) + qb_1.d * static_cast<float>(qb_1.bsum);
+        bsum_acc4_a = _mm_fmadd_ps(d4_v, _mm_set1_ps(qba), bsum_acc4_a);
+        bsum_acc4_b = _mm_fmadd_ps(d4_v, _mm_set1_ps(qbb), bsum_acc4_b);
+      }
+      Hsum4Avx2(acc0_a, acc1_a, acc2_a, acc3_a, out4_a);
+      Hsum4Avx2(acc0_b, acc1_b, acc2_b, acc3_b, out4_b);
+      _mm_storeu_ps(out4_a, _mm_sub_ps(_mm_loadu_ps(out4_a), bsum_acc4_a));
+      _mm_storeu_ps(out4_b, _mm_sub_ps(_mm_loadu_ps(out4_b), bsum_acc4_b));
+      return;
+    }
+    default: {
+      VecDotGgufRow4xQ8Avx2(quant_type, row0, row1, row2, row3, x_qa, K, out4_a);
+      VecDotGgufRow4xQ8Avx2(quant_type, row0, row1, row2, row3, x_qb, K, out4_b);
+      return;
+    }
+  }
+}
+
 #endif  // ORT_GGUF_CPU_HAS_AVX2_TARGET
 
 inline float VecDotGgufRowScalar(int quant_type, const uint8_t* weight_row, const float* x, int64_t K) {
@@ -2014,6 +2415,59 @@ inline void VecDotGgufGateUpRow2xQ8Cpu(
   out_up2[1] = VecDotGgufRowQ8Cpu(up_type, up_row1, x_q8, K);
 }
 
+inline void VecDotGgufRow4xQ8Batch2Cpu(
+    int quant_type,
+    const uint8_t* row0,
+    const uint8_t* row1,
+    const uint8_t* row2,
+    const uint8_t* row3,
+    const GgufQ8Block* x_qa,
+    const GgufQ8Block* x_qb,
+    int64_t K,
+    float* out4_a,
+    float* out4_b) {
+#if ORT_GGUF_CPU_HAS_AVX2_TARGET
+  if (CpuSupportsAvx2Fma()) {
+    VecDotGgufRow4xQ8Batch2Avx2(quant_type, row0, row1, row2, row3, x_qa, x_qb, K, out4_a, out4_b);
+    return;
+  }
+#endif
+  VecDotGgufRow4xQ8Cpu(quant_type, row0, row1, row2, row3, x_qa, K, out4_a);
+  VecDotGgufRow4xQ8Cpu(quant_type, row0, row1, row2, row3, x_qb, K, out4_b);
+}
+
+inline void VecDotGgufGateUpRow2xQ8Batch2Cpu(
+    int gate_type,
+    const uint8_t* gate_row0,
+    const uint8_t* gate_row1,
+    int up_type,
+    const uint8_t* up_row0,
+    const uint8_t* up_row1,
+    const GgufQ8Block* x_qa,
+    const GgufQ8Block* x_qb,
+    int64_t K,
+    float* out_gate2_a,
+    float* out_up2_a,
+    float* out_gate2_b,
+    float* out_up2_b) {
+  if (gate_type == up_type) {
+    float out4_a[4];
+    float out4_b[4];
+    VecDotGgufRow4xQ8Batch2Cpu(gate_type, gate_row0, gate_row1, up_row0, up_row1, x_qa, x_qb, K, out4_a, out4_b);
+    out_gate2_a[0] = out4_a[0];
+    out_gate2_a[1] = out4_a[1];
+    out_up2_a[0] = out4_a[2];
+    out_up2_a[1] = out4_a[3];
+    out_gate2_b[0] = out4_b[0];
+    out_gate2_b[1] = out4_b[1];
+    out_up2_b[0] = out4_b[2];
+    out_up2_b[1] = out4_b[3];
+    return;
+  }
+  VecDotGgufGateUpRow2xQ8Cpu(gate_type, gate_row0, gate_row1, up_type, up_row0, up_row1, x_qa, K, out_gate2_a, out_up2_a);
+  VecDotGgufGateUpRow2xQ8Cpu(gate_type, gate_row0, gate_row1, up_type, up_row0, up_row1, x_qb, K, out_gate2_b, out_up2_b);
+}
+
 template <typename T>
 inline float ActTypeToFloatCpu(T v) noexcept {
   if constexpr (std::is_same_v<T, float>) {
@@ -2177,13 +2631,21 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
     inter_q8 = local_inter_q8.data();
   }
 
-  for (int u = 0; u < num_unique_toks; ++u) {
+  auto quant_in_fn = [&](std::ptrdiff_t u_idx) {
+    const int u = static_cast<int>(u_idx);
     const T* src_row = input + static_cast<size_t>(unique_toks[u]) * hidden_size;
     float* dst_row = x_f32 + static_cast<size_t>(u) * hidden_size;
     for (int j = 0; j < hidden_size; ++j) {
       dst_row[j] = ActTypeToFloatCpu<T>(src_row[j]);
     }
     QuantizeRowQ8Cpu(dst_row, hidden_size, x_q8 + static_cast<size_t>(u) * q8_blocks_per_hidden);
+  };
+  if (num_unique_toks >= 2) {
+    parallel_for(static_cast<std::ptrdiff_t>(num_unique_toks), quant_in_fn);
+  } else {
+    for (int u = 0; u < num_unique_toks; ++u) {
+      quant_in_fn(u);
+    }
   }
 
   constexpr int kFc1Tile = 32;
@@ -2310,36 +2772,45 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
     int start;
     int count;
   };
-  std::vector<int> sorted_c(static_cast<size_t>(num_cold_routes));
-  for (int c = 0; c < num_cold_routes; ++c) {
-    sorted_c[static_cast<size_t>(c)] = c;
+  int sorted_c_stack[128];
+  ColdExpertGroup groups_stack[128];
+  std::vector<int> sorted_c_vec;
+  std::vector<ColdExpertGroup> groups_vec;
+  int* sorted_c = sorted_c_stack;
+  ColdExpertGroup* groups = groups_stack;
+  if (num_cold_routes > 128) {
+    sorted_c_vec.resize(static_cast<size_t>(num_cold_routes));
+    groups_vec.resize(static_cast<size_t>(num_cold_routes));
+    sorted_c = sorted_c_vec.data();
+    groups = groups_vec.data();
   }
-  std::sort(sorted_c.begin(), sorted_c.end(), [&](int a, int b) {
+  for (int c = 0; c < num_cold_routes; ++c) {
+    sorted_c[c] = c;
+  }
+  std::sort(sorted_c, sorted_c + num_cold_routes, [&](int a, int b) {
     const int ea = topk_indices[cold_route_ids[a]];
     const int eb = topk_indices[cold_route_ids[b]];
     return (ea != eb) ? (ea < eb) : (a < b);
   });
 
-  std::vector<ColdExpertGroup> groups;
-  groups.reserve(static_cast<size_t>(num_cold_routes));
+  int num_groups = 0;
   for (int idx = 0; idx < num_cold_routes;) {
-    const int e = topk_indices[cold_route_ids[sorted_c[static_cast<size_t>(idx)]]];
+    const int e = topk_indices[cold_route_ids[sorted_c[idx]]];
     int end = idx + 1;
     while (end < num_cold_routes &&
-           topk_indices[cold_route_ids[sorted_c[static_cast<size_t>(end)]]] == e) {
+           topk_indices[cold_route_ids[sorted_c[end]]] == e) {
       ++end;
     }
-    groups.push_back(ColdExpertGroup{e, idx, end - idx});
+    groups[num_groups++] = ColdExpertGroup{e, idx, end - idx};
     idx = end;
   }
-  const int num_groups = static_cast<int>(groups.size());
 
   // Phase 1 (Expert-Grouped): Fused Gate + Up + SwiGLU + Q8 intermediate quantization.
   const std::ptrdiff_t total_fc1_tasks = static_cast<std::ptrdiff_t>(num_groups) * fc1_tiles_per_route;
   auto fc1_grouped_fn = [&](std::ptrdiff_t task_idx) {
     const int g_idx = static_cast<int>(task_idx) / fc1_tiles_per_route;
     const int tile_idx = static_cast<int>(task_idx) % fc1_tiles_per_route;
-    const ColdExpertGroup grp = groups[static_cast<size_t>(g_idx)];
+    const ColdExpertGroup grp = groups[g_idx];
     const int expert = grp.expert;
     const int j_start = tile_idx * kFc1Tile;
     const int j_end = std::min(inter_size, j_start + kFc1Tile);
@@ -2356,8 +2827,32 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
       const float ub0 = (up_bias != nullptr) ? ActTypeToFloatCpu<T>(up_bias[exp_row_idx0]) : 0.0f;
       const float ub1 = (up_bias != nullptr) ? ActTypeToFloatCpu<T>(up_bias[exp_row_idx1]) : 0.0f;
 
-      for (int b = 0; b < grp.count; ++b) {
-        const int c = sorted_c[static_cast<size_t>(grp.start + b)];
+      int b = 0;
+      for (; b + 1 < grp.count; b += 2) {
+        const int ca = sorted_c[grp.start + b];
+        const int cb = sorted_c[grp.start + b + 1];
+        const GgufQ8Block* x_qa = x_q8 + static_cast<size_t>(route_to_local_tok[ca]) * q8_blocks_per_hidden;
+        const GgufQ8Block* x_qb = x_q8 + static_cast<size_t>(route_to_local_tok[cb]) * q8_blocks_per_hidden;
+        float* inter_a = inter_f32 + static_cast<size_t>(ca) * inter_size;
+        float* inter_b = inter_f32 + static_cast<size_t>(cb) * inter_size;
+        float ga[2], ua[2], gb[2], ub[2];
+        VecDotGgufGateUpRow2xQ8Batch2Cpu(
+            gate_type, g_row0, g_row1, up_type, u_row0, u_row1, x_qa, x_qb, hidden_size, ga, ua, gb, ub);
+        const float ga0 = RoundToActFloatCpu<T>(ga[0] + gb0);
+        const float ua0 = RoundToActFloatCpu<T>(ua[0] + ub0);
+        const float ga1 = RoundToActFloatCpu<T>(ga[1] + gb1);
+        const float ua1 = RoundToActFloatCpu<T>(ua[1] + ub1);
+        inter_a[j + 0] = RoundToActFloatCpu<T>(ua0 * (ga0 / (1.0f + std::exp(-ga0))));
+        inter_a[j + 1] = RoundToActFloatCpu<T>(ua1 * (ga1 / (1.0f + std::exp(-ga1))));
+        const float gb_0 = RoundToActFloatCpu<T>(gb[0] + gb0);
+        const float ub_0 = RoundToActFloatCpu<T>(ub[0] + ub0);
+        const float gb_1 = RoundToActFloatCpu<T>(gb[1] + gb1);
+        const float ub_1 = RoundToActFloatCpu<T>(ub[1] + ub1);
+        inter_b[j + 0] = RoundToActFloatCpu<T>(ub_0 * (gb_0 / (1.0f + std::exp(-gb_0))));
+        inter_b[j + 1] = RoundToActFloatCpu<T>(ub_1 * (gb_1 / (1.0f + std::exp(-gb_1))));
+      }
+      for (; b < grp.count; ++b) {
+        const int c = sorted_c[grp.start + b];
         const GgufQ8Block* x_q8_row = x_q8 + static_cast<size_t>(route_to_local_tok[c]) * q8_blocks_per_hidden;
         float* inter_row = inter_f32 + static_cast<size_t>(c) * inter_size;
         float g_raw[2];
@@ -2379,7 +2874,7 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
       const float gb = (gate_bias != nullptr) ? ActTypeToFloatCpu<T>(gate_bias[exp_row_idx]) : 0.0f;
       const float ub = (up_bias != nullptr) ? ActTypeToFloatCpu<T>(up_bias[exp_row_idx]) : 0.0f;
       for (int b = 0; b < grp.count; ++b) {
-        const int c = sorted_c[static_cast<size_t>(grp.start + b)];
+        const int c = sorted_c[grp.start + b];
         const GgufQ8Block* x_q8_row = x_q8 + static_cast<size_t>(route_to_local_tok[c]) * q8_blocks_per_hidden;
         float* inter_row = inter_f32 + static_cast<size_t>(c) * inter_size;
         float g_raw = 0.0f;
@@ -2391,7 +2886,7 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
       }
     }
     for (int b = 0; b < grp.count; ++b) {
-      const int c = sorted_c[static_cast<size_t>(grp.start + b)];
+      const int c = sorted_c[grp.start + b];
       float* inter_row = inter_f32 + static_cast<size_t>(c) * inter_size;
       QuantizeBlockQ8Cpu(
           inter_row + j_start,
@@ -2405,7 +2900,7 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
   auto fc2_grouped_fn = [&](std::ptrdiff_t task_idx) {
     const int g_idx = static_cast<int>(task_idx) / fc2_tiles_per_route;
     const int tile_idx = static_cast<int>(task_idx) % fc2_tiles_per_route;
-    const ColdExpertGroup grp = groups[static_cast<size_t>(g_idx)];
+    const ColdExpertGroup grp = groups[g_idx];
     const int expert = grp.expert;
     const int n_start = tile_idx * kFc2Tile;
     const int n_end = std::min(hidden_size, n_start + kFc2Tile);
@@ -2422,8 +2917,23 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
           db4[m] = ActTypeToFloatCpu<T>(down_bias[exp_row_idx + m]);
         }
       }
-      for (int b = 0; b < grp.count; ++b) {
-        const int c = sorted_c[static_cast<size_t>(grp.start + b)];
+      int b = 0;
+      for (; b + 1 < grp.count; b += 2) {
+        const int ca = sorted_c[grp.start + b];
+        const int cb = sorted_c[grp.start + b + 1];
+        const GgufQ8Block* qa = inter_q8 + static_cast<size_t>(ca) * q8_blocks_per_inter;
+        const GgufQ8Block* qb = inter_q8 + static_cast<size_t>(cb) * q8_blocks_per_inter;
+        T* dst_a = cold_fc2_out + static_cast<size_t>(ca) * hidden_size;
+        T* dst_b = cold_fc2_out + static_cast<size_t>(cb) * hidden_size;
+        float d4_a[4], d4_b[4];
+        VecDotGgufRow4xQ8Batch2Cpu(down_type, r0, r1, r2, r3, qa, qb, inter_size, d4_a, d4_b);
+        for (int m = 0; m < 4; ++m) {
+          dst_a[n + m] = FloatToActTypeCpu<T>(d4_a[m] + db4[m]);
+          dst_b[n + m] = FloatToActTypeCpu<T>(d4_b[m] + db4[m]);
+        }
+      }
+      for (; b < grp.count; ++b) {
+        const int c = sorted_c[grp.start + b];
         const GgufQ8Block* inter_q8_row = inter_q8 + static_cast<size_t>(c) * q8_blocks_per_inter;
         T* dst_row = cold_fc2_out + static_cast<size_t>(c) * hidden_size;
         float d4[4];
@@ -2438,7 +2948,7 @@ inline void ExecuteMoEPackedColdRoutesCpuWithScratch(
       const uint8_t* r0 = down_weights + exp_row_idx * down_row_bytes;
       const float db = (down_bias != nullptr) ? ActTypeToFloatCpu<T>(down_bias[exp_row_idx]) : 0.0f;
       for (int b = 0; b < grp.count; ++b) {
-        const int c = sorted_c[static_cast<size_t>(grp.start + b)];
+        const int c = sorted_c[grp.start + b];
         const GgufQ8Block* inter_q8_row = inter_q8 + static_cast<size_t>(c) * q8_blocks_per_inter;
         T* dst_row = cold_fc2_out + static_cast<size_t>(c) * hidden_size;
         const float d_raw = VecDotGgufRowQ8Cpu(down_type, r0, inter_q8_row, inter_size);
