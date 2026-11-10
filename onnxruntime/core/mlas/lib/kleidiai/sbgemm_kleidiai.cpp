@@ -15,6 +15,8 @@
 
 #include "kai/ukernels/matmul/pack/kai_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme.h"
 #include "kai/ukernels/matmul/pack/kai_lhs_pack_bf16p2vlx2_f32_sme.h"
+#include "kai/ukernels/matmul/pack/kai_rhs_quant_pack_kxn_bf16p12x4biasf32_f32_neon.h"
+#include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p8x4_f32_neon.h"
 
 #include "mlasi_kleidiai.h"
 #include "kai_ukernel_interface.h"
@@ -29,6 +31,41 @@ struct KaiTlsBuffersSbgemm {
 static thread_local KaiTlsBuffersSbgemm g_kai_tls_sbgemm;
 
 const KaiBF16SBgemmKernel& sbgemm_gemm = GetKleidiAISBGemmUKernel();
+
+//
+// The packing routines must match the matmul ukernel selected by GetKleidiAISBGemmUKernel():
+// the SME2 kernel on CPUs with SME2, otherwise the NEON BFMMLA kernel.
+//
+static size_t SBGemmLhsPackedSize(size_t M, size_t K, size_t mr, size_t kr, size_t sr) {
+    return ArmKleidiAI::UseSME2 ? kai_get_lhs_packed_size_lhs_pack_bf16p2vlx2_f32_sme(M, K, mr, kr, sr)
+                                : kai_get_lhs_packed_size_lhs_quant_pack_bf16p8x4_f32_neon(M, K, mr, kr, sr);
+}
+
+static void SBGemmRunLhsPack(size_t M, size_t K, size_t mr, size_t kr, size_t sr,
+                             const float* A, size_t lda, void* LhsPacked) {
+    if (ArmKleidiAI::UseSME2) {
+        kai_run_lhs_pack_bf16p2vlx2_f32_sme(M, K, mr, kr, sr, 0, A, lda * sizeof(float), LhsPacked);
+    } else {
+        kai_run_lhs_quant_pack_bf16p8x4_f32_neon(M, K, mr, kr, sr, 0, A, lda * sizeof(float), LhsPacked);
+    }
+}
+
+static size_t SBGemmRhsPackedSize(size_t N, size_t K) {
+    return ArmKleidiAI::UseSME2 ? kai_get_rhs_packed_size_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme(N, K)
+                                : kai_get_rhs_packed_size_rhs_quant_pack_kxn_bf16p12x4biasf32_f32_neon(
+                                      N, K, sbgemm_gemm.ukernel.get_nr(), sbgemm_gemm.ukernel.get_kr());
+}
+
+static void SBGemmRunRhsPack(size_t N, size_t K, size_t nr, size_t kr, size_t sr,
+                             const float* B, size_t ldb, const float* Bias, void* PackedB) {
+    if (ArmKleidiAI::UseSME2) {
+        kai_run_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme(1, N, K, nr, kr, sr, ldb * sizeof(float), B, Bias, nullptr,
+                                                     PackedB, 0, nullptr);
+    } else {
+        kai_run_rhs_quant_pack_kxn_bf16p12x4biasf32_f32_neon(1, N, K, nr, kr, sr, ldb * sizeof(float), B, Bias, nullptr,
+                                                             PackedB, 0, nullptr);
+    }
+}
 
 /*++
 Routine Description:
@@ -143,7 +180,7 @@ Return Value:
     // Compute the number of bytes required to hold the packed buffer.
     //
     size_t bytes = 0;
-    bytes = kai_get_rhs_packed_size_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme(N, K);
+    bytes = SBGemmRhsPackedSize(N, K);
 
     return bytes;
 }
@@ -203,7 +240,7 @@ Return Value:
     // Ensure size and zero the used span.
     g_kai_tls_sbgemm.bias_zero.resize(N, 0.0f);
 
-    kai_run_rhs_pack_kxn_bf16p2vlx2b_f32_x32_sme(1, N, K, nr, kr, sr, ldb * sizeof(float), B, g_kai_tls_sbgemm.bias_zero.data(), nullptr, PackedB, 0, nullptr);
+    SBGemmRunRhsPack(N, K, nr, kr, sr, B, ldb, g_kai_tls_sbgemm.bias_zero.data(), PackedB);
 
     return true;
 }
@@ -276,7 +313,7 @@ Return Value:
     size_t LhsPackedStride = 0;
     std::byte* LhsPackedData = nullptr;
 
-    LhsPackedStride = kai_get_lhs_packed_size_lhs_pack_bf16p2vlx2_f32_sme(M, K, mr, kr, sr);
+    LhsPackedStride = SBGemmLhsPackedSize(M, K, mr, kr, sr);
 
     size_t lhs_resize = 0;
     if (MlasMultiplyOverflowsSizeT(LhsPackedStride, BatchSize, &lhs_resize))
@@ -297,8 +334,10 @@ Return Value:
         // We have already decided the matmul variant we are using, before having values for M,N,K
         MlasTrySimpleParallel(ThreadPool, BatchSize, [&](ptrdiff_t batch_idx) {
             std::byte* LhsPackedPtr = &(LhsPackedData[LhsPackedStride * batch_idx]);
-            KLEIDIAI_KERNEL_LOG("kai_run_lhs_pack_bf16p2vlx2_f32_sme" << " M=" << M << " K=" << K << " mr=" << mr << " kr=" << kr << " sr=" << sr);
-            kai_run_lhs_pack_bf16p2vlx2_f32_sme(M, K, mr, kr, sr, 0, Data[batch_idx].A, Data[batch_idx].lda * sizeof(float), LhsPackedPtr);
+            KLEIDIAI_KERNEL_LOG("SBGemmRunLhsPack"
+                                << " M=" << M << " K=" << K << " mr=" << mr << " kr=" << kr << " sr=" << sr);
+            SBGemmRunLhsPack(M, K, mr, kr, sr, reinterpret_cast<const float*>(Data[batch_idx].A),
+                             Data[batch_idx].lda, LhsPackedPtr);
         });
     } else {
         // Multithread pack lhs and rhs
@@ -317,9 +356,10 @@ Return Value:
             if (batch_idx & 0x1) {
                 batch_idx >>= 1;
                 std::byte* LhsPackedPtr = &(LhsPackedData[LhsPackedStride * batch_idx]);
-                KLEIDIAI_KERNEL_LOG("kai_run_lhs_pack_bf16p2vlx2_f32_sme"
+                KLEIDIAI_KERNEL_LOG("SBGemmRunLhsPack"
                                     << " M=" << M << " K=" << K << " mr=" << mr << " kr=" << kr << " sr=" << sr);
-                kai_run_lhs_pack_bf16p2vlx2_f32_sme(M, K, mr, kr, sr, 0, Data[batch_idx].A, Data[batch_idx].lda * sizeof(float), LhsPackedPtr);
+                SBGemmRunLhsPack(M, K, mr, kr, sr, reinterpret_cast<const float*>(Data[batch_idx].A),
+                                 Data[batch_idx].lda, LhsPackedPtr);
             } else {
                 batch_idx >>= 1;
                 std::byte* RhsPackedPtr = &(RhsPackedData[RhsPackedStride * batch_idx]);

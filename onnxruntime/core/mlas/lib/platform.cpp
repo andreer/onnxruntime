@@ -962,15 +962,17 @@ Return Value:
         this->MlasConvPrepareOverride = ArmKleidiAI::MlasConvPrepare;
         this->MlasConvOverride = ArmKleidiAI::MlasConv;
         this->MlasConvSGemmRouteOverride = ArmKleidiAI::MlasConvSGemmRoute;
-#if defined(MLAS_SBGEMM_AVAILABLE)
-        // Currently only an SME2 variant of SBGEMM exists
-        if (ArmKleidiAI::UseSME2){
-            this->MlasSBGemmBatchOverride = ArmKleidiAI::MlasSBGemmBatch;
-            this->MlasSBGemmPackBSizeOverride = ArmKleidiAI::MlasSBGemmPackBSize;
-            this->MlasSBGemmPackBOverride = ArmKleidiAI::MlasSBGemmPackB;
-        }
-#endif
     }
+
+#if defined(MLAS_SBGEMM_AVAILABLE)
+    // SBGEMM uses the SME2 kernel where available, otherwise the NEON BFMMLA kernel on CPUs with the
+    // BF16 extension (e.g. Neoverse V1/V2/V3), see GetKleidiAISBGemmUKernel().
+    if (ArmKleidiAI::UseSME2 || cpuid_info.HasArmNeon_BF16()) {
+        this->MlasSBGemmBatchOverride = ArmKleidiAI::MlasSBGemmBatch;
+        this->MlasSBGemmPackBSizeOverride = ArmKleidiAI::MlasSBGemmPackBSize;
+        this->MlasSBGemmPackBOverride = ArmKleidiAI::MlasSBGemmPackB;
+    }
+#endif
 
     // QNBitGemm performs its own runtime feature selection.
     this->MlasQNBitGemmIsSupportedOverride = ArmKleidiAI::MlasQNBitGemmIsSupported;

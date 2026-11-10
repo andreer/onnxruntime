@@ -44,6 +44,12 @@
 #include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa.h"
 #include "kai/ukernels/matmul/matmul_clamp_fp32_bf16p_bf16p/kai_matmul_clamp_f32_bf16p2vlx2_bf16p2vlx2_2vlx2vl_sme2_mopa.h"
 
+// NEON BF16 kernel (BFMMLA), for Arm CPUs with the BF16 extension but without SME2. KleidiAI does not build it
+// with MSVC (GCC inline assembly), and SBGEMM is only available where MLAS_SBGEMM_AVAILABLE is defined.
+#if defined(MLAS_SBGEMM_AVAILABLE)
+#include "kai/ukernels/matmul/matmul_clamp_f32_bf16p_bf16p/kai_matmul_clamp_f32_bf16p8x4_bf16p12x4b_8x12_neon_mmla.h"
+#endif
+
 //   GEMV
 #include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p16vlx1b_1x16vl_sme2_mla.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p2vlx1b_1x16vl_sme2_mla.h"
@@ -305,6 +311,11 @@ const KaiF16IMatmulKernel imatmul_f16_conv_sme2 =
 const KaiBF16SBgemmKernel sbgemm_gemm_sme2 =
     KAI_WRAP_UKERNEL_RUN_MATMUL_11(matmul_clamp_f32_bf16p2vlx2_bf16p2vlx2_2vlx2vl_sme2_mopa);
 
+#if defined(MLAS_SBGEMM_AVAILABLE)
+const KaiBF16SBgemmKernel sbgemm_gemm_neon_mmla =
+    KAI_WRAP_UKERNEL_RUN_MATMUL_11(matmul_clamp_f32_bf16p8x4_bf16p12x4b_8x12_neon_mmla);
+#endif
+
 #if defined(ENABLE_QMX_KERNELS)
 const KaiF32IMatmulKernel imatmul_conv_qmx =
     KAI_WRAP_UKERNEL_RUN_IMATMUL_PACKED_7(imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_qmx_mopa);
@@ -482,7 +493,11 @@ const KaiDynamicQGemmKernel& GetKleidiAIQGemmUKernel() {
 }
 
 const KaiBF16SBgemmKernel& GetKleidiAISBGemmUKernel() {
-    // Currently only SME2 variant exists for bfloat16/SBGEMM kernel
+#if defined(MLAS_SBGEMM_AVAILABLE)
+    if (!MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME2()) {
+        return sbgemm_gemm_neon_mmla;
+    }
+#endif
     return sbgemm_gemm_sme2;
 }
 
