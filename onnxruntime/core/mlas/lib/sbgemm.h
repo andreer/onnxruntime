@@ -156,9 +156,12 @@ MlasSBGemmNonPackedOperation(size_t M, size_t N, size_t K, const float* A, size_
     //
     // Compute the strides to step through slices of the input matrices.
     //
-    // Expand the N stride if K is small or expand the K stride if N is small
-    // for better utilization of the B panel. Avoid changing the K stride if
-    // the A panel needs to be used for transposing.
+    // Expand the N stride if K is small for better utilization of the B panel.
+    //
+    // The K stride must not grow beyond Strides.K: MlasSBGemmConvertPackB packs B in slices of
+    // at most Strides.K rows along the K dimension, each slice covering all columns, while the
+    // kernel walks one column block through the whole CountK it is given. A deeper panel would
+    // make the kernel read the next column block's data as more K.
     //
     constexpr MLAS_SBGEMM_STRIDES Strides = KernelType::Strides;
     size_t StrideN = Strides.N;
@@ -168,11 +171,6 @@ MlasSBGemmNonPackedOperation(size_t M, size_t N, size_t K, const float* A, size_
         while (StrideK / 2 >= K) {
             StrideN *= 2;
             StrideK /= 2;
-        }
-    } else {
-        while (StrideN > 16 && StrideN / 2 >= N) {
-            StrideK *= 2;
-            StrideN /= 2;
         }
     }
 

@@ -13,10 +13,12 @@
 #include "test/util/include/test_environment.h"
 #include "default_providers.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <random>
 
 #if defined(MLAS_SBGEMM_AVAILABLE)
 
@@ -266,6 +268,55 @@ TEST(MathOpTest, MatMulFloatTypeFastMathKTailDoesNotReadPaddedA) {
       ASSERT_TRUE(std::isfinite(output_data[i])) << "Output " << i << " should not include padded A tail values.";
       ASSERT_EQ(output_data[i], expected_vals[i]) << "Output " << i;
     }
+  }
+}
+
+// A non-constant B takes the non-packed SBGemm path, which used to hand the kernel more than 256 rows of K at once
+// when N is small, and the kernel then read the next column block's data as more K. Inputs are small integers that
+// bf16 represents exactly, so the result is exact and every output element can be compared. They are pseudo-random,
+// since a periodic pattern can make the wrongly read rows equal to the right ones.
+TEST(MathOpTest, MatMulFloatTypeFastMathRuntimeBDeepK) {
+  struct Shape {
+    int64_t M, K, N;
+  };
+  // The first shape (K = 256) never needed more than one K slice and passes with or without the fix.
+  // K = 257 is the boundary: a single wrongly read K row is visible with the exact comparison.
+  constexpr std::array<Shape, 7> shapes{{{64, 256, 32},
+                                         {64, 257, 32},
+                                         {64, 300, 32},
+                                         {64, 384, 64},
+                                         {7, 512, 11},
+                                         {1, 600, 8},
+                                         {128, 512, 32}}};
+  for (const Shape& s : shapes) {
+    SCOPED_TRACE("M=" + std::to_string(s.M) + " K=" + std::to_string(s.K) + " N=" + std::to_string(s.N));
+
+    std::mt19937 rng(42);
+    auto small_int = [&rng]() { return static_cast<float>(static_cast<int>(rng() % 5) - 2); };
+    std::vector<float> a(s.M * s.K), b(s.K * s.N), expected(s.M * s.N, 0.0f);
+    std::generate(a.begin(), a.end(), small_int);
+    std::generate(b.begin(), b.end(), small_int);
+    for (int64_t i = 0; i < s.M; ++i) {
+      for (int64_t n = 0; n < s.N; ++n) {
+        for (int64_t k = 0; k < s.K; ++k) {
+          expected[i * s.N + n] += a[i * s.K + k] * b[k * s.N + n];
+        }
+      }
+    }
+
+    OpTester test("MatMul", 13);
+    test.AddInput<float>("A", {s.M, s.K}, a);
+    test.AddInput<float>("B", {s.K, s.N}, b, /*is_initializer*/ false);
+    test.AddOutput<float>("Y", {s.M, s.N}, expected);
+
+    SessionOptions so;
+    ASSERT_STATUS_OK(so.config_options.AddConfigEntry(kOrtSessionOptionsMlasGemmFastMathArm64Bfloat16, "1"));
+
+    std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+    execution_providers.push_back(DefaultCpuExecutionProvider());
+    test.ConfigEps(std::move(execution_providers))
+        .Config(so)
+        .RunWithConfig();
   }
 }
 
