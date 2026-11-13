@@ -1,25 +1,34 @@
-# Experimental: builds the KleidiAI NEON SBGEMM change on Arm64 runners with BF16, runs the SBGEMM MLAS tests, the
-# fast-math operator tests and the full MLAS suite, and benchmarks SBGEMM for the change against the parent commit
-# (stock). Not part of any pull request.
+# Experimental: builds the KleidiAI NEON SBGEMM change on Arm64 runners, runs the SBGEMM MLAS tests and the fast-math
+# operator tests, then benchmarks SBGEMM for the change against stock (the upstream base commit) in interleaved
+# rounds on several runners, for a paired statistical comparison. Not part of any pull request.
 name: SBGEMM KleidiAI NEON test
 
 on:
   push:
     branches: [ci-test-change2]
   workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Interleaved benchmark rounds per benchmark job"
+        default: "8"
+
+env:
+  # Upstream commit the change is based on; the stock benchmark is built from its MLAS sources.
+  BASE_SHA: ca7ea48049a46ee9da75ac7b292e4cb44978a935
+  ROUNDS: ${{ github.event.inputs.rounds || '8' }}
 
 jobs:
-  test:
+  build:
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04-arm, macos-15-xlarge]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 340
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 3
 
       - uses: actions/setup-python@v5
         with:
@@ -49,44 +58,74 @@ jobs:
         run: |
           cmake --build build/Release --parallel --target onnxruntime_mlas_test onnxruntime_provider_test \
             onnxruntime_mlas_benchmark > out/build-change.log 2>&1 || { grep -m20 -E 'error' out/build-change.log; exit 1; }
-          grep -c -E 'warning:.*(kleidiai/|platform.cpp|matmul_fastmath_test|bench_sbgemm)' out/build-change.log || true
-          mkdir -p bin/change
-          cp build/Release/onnxruntime_mlas_test build/Release/onnxruntime_provider_test \
-            build/Release/onnxruntime_mlas_benchmark bin/change/
+          echo "warnings in changed files: $(grep -c -E 'warning:.*(kleidiai/|platform.cpp|matmul_fastmath_test|bench_sbgemm)' out/build-change.log || true)"
+          mkdir -p bin/change && cp build/Release/onnxruntime_mlas_benchmark bin/change/
 
       - name: Tests
         run: |
           rc=0
-          (cd bin/change && ./onnxruntime_mlas_test --gtest_filter='SBGemm*') > out/mlas-sbgemm.log 2>&1 || rc=1
-          (cd bin/change && ./onnxruntime_provider_test \
-            --gtest_filter='MathOpTest.*FastMath*:MathOpTest.MatMul*:Einsum.BFloat16*') > out/op.log 2>&1 || rc=1
-          (cd bin/change && ./onnxruntime_mlas_test) > out/mlas-full.log 2>&1 || rc=1
-          grep -h -E '^\[  (PASSED|FAILED)  \] [0-9]+ test' out/mlas-sbgemm.log out/op.log out/mlas-full.log
+          build/Release/onnxruntime_mlas_test --gtest_filter='SBGemm*' > out/mlas-sbgemm.log 2>&1 || rc=1
+          build/Release/onnxruntime_provider_test \
+            --gtest_filter='MathOpTest.*FastMath*:MathOpTest.MatMul*:Einsum.BFloat16*' > out/op.log 2>&1 || rc=1
+          grep -h -E '^\[  (PASSED|FAILED)  \] [0-9]+ test' out/mlas-sbgemm.log out/op.log
           echo "$rc" > out/tests-rc.txt
 
-      - name: Build stock benchmark (parent commit)
+      - name: Build stock benchmark (upstream base)
         run: |
-          git checkout HEAD~1 -- onnxruntime/core/mlas/lib/kleidiai/sbgemm_kleidiai.cpp \
+          git fetch -q --depth=1 origin "$BASE_SHA"
+          git checkout "$BASE_SHA" -- onnxruntime/core/mlas/lib/kleidiai/sbgemm_kleidiai.cpp \
             onnxruntime/core/mlas/lib/kleidiai/kai_ukernel_interface.cpp \
             onnxruntime/core/mlas/lib/kleidiai/kai_ukernel_interface.h onnxruntime/core/mlas/lib/platform.cpp
           cmake --build build/Release --parallel --target onnxruntime_mlas_benchmark > out/build-stock.log 2>&1 \
             || { grep -m20 -E 'error' out/build-stock.log; exit 1; }
           mkdir -p bin/stock && cp build/Release/onnxruntime_mlas_benchmark bin/stock/
 
-      - name: Benchmark
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.runner }}
+          path: bin/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-${{ matrix.runner }}
+          path: out/
+
+      - name: Fail if tests failed
+        run: test "$(cat out/tests-rc.txt)" = 0
+
+  bench:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-15-xlarge]
+        replica: [1, 2]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.runner }}
+          path: bin
+
+      - name: Benchmark in interleaved rounds
         run: |
-          for v in stock change; do
-            bin/$v/onnxruntime_mlas_benchmark --benchmark_filter='SBGEMM/' --benchmark_min_time=0.1s \
-              --benchmark_repetitions=3 --benchmark_report_aggregates_only=true --benchmark_format=json \
-              --benchmark_out=out/bench-$v.json > out/bench-$v.log 2>&1
-            echo "bench $v rc=$?"
+          chmod +x bin/*/onnxruntime_mlas_benchmark
+          mkdir -p out
+          if [ "$(uname)" = Darwin ]; then sysctl machdep.cpu.brand_string hw.ncpu > out/cpu.txt; else lscpu > out/cpu.txt; fi
+          # ABBA order: odd rounds run stock first, even rounds run the change first.
+          for r in $(seq 1 "$ROUNDS"); do
+            if [ $((r % 2)) = 1 ]; then order="stock change"; else order="change stock"; fi
+            for v in $order; do
+              bin/$v/onnxruntime_mlas_benchmark --benchmark_filter='SBGEMM/' --benchmark_min_time=0.2s \
+                --benchmark_format=json --benchmark_out=out/bench-$v-r$r.json > out/bench-$v-r$r.log 2>&1
+              echo "round $r $v rc=$?"
+            done
           done
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sbgemm-${{ matrix.runner }}
+          name: bench-${{ matrix.runner }}-${{ matrix.replica }}
           path: out/
-
-      - name: Fail if tests failed
-        run: test "$(cat out/tests-rc.txt)" = 0

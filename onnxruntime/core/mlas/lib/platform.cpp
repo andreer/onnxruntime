@@ -966,8 +966,15 @@ Return Value:
 
 #if defined(MLAS_SBGEMM_AVAILABLE)
     // SBGEMM uses the SME2 kernel where available, otherwise the NEON BF16 kernels on CPUs with the
-    // BF16 extension (e.g. Neoverse V1/V2/V3), see sbgemm_kleidiai.cpp.
-    if (ArmKleidiAI::UseSME2 || cpuid_info.HasArmNeon_BF16()) {
+    // BF16 extension (measured on Neoverse V1/V2/V3/N2), see sbgemm_kleidiai.cpp. Not on Apple silicon:
+    // on Apple M2 Pro they were at most about 10% faster than MLAS's own kernel at full blocks, and 2 to 4
+    // times slower for a constant B with 2 to 4 rows.
+#if defined(__APPLE__)
+    constexpr bool use_kleidiai_sbgemm_neon = false;
+#else
+    const bool use_kleidiai_sbgemm_neon = cpuid_info.HasArmNeon_BF16();
+#endif
+    if (ArmKleidiAI::UseSME2 || use_kleidiai_sbgemm_neon) {
         this->MlasSBGemmBatchOverride = ArmKleidiAI::MlasSBGemmBatch;
         this->MlasSBGemmPackBSizeOverride = ArmKleidiAI::MlasSBGemmPackBSize;
         this->MlasSBGemmPackBOverride = ArmKleidiAI::MlasSBGemmPackB;
