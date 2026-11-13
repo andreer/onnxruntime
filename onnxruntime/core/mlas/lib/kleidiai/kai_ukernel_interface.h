@@ -102,5 +102,12 @@ const KaiF16IMatmulKernel& GetKleidiAIF16IMatmulUKernel();
 // Returns the selected BF16 SBGEMM ukernel used by the KleidiAI based on runtime CPU capabilities.
 const KaiBF16SBgemmKernel& GetKleidiAISBGemmUKernel();
 
+#if defined(MLAS_SBGEMM_AVAILABLE)
+// BF16 SBGEMM ukernels for CPUs with BF16 but without SME2: an 8-row BFMMLA kernel, and a single-row kernel that
+// reads the same packed B.
+const KaiBF16SBgemmKernel& GetKleidiAISBGemmNeonUKernel();
+const KaiBF16SBgemmKernel& GetKleidiAISBGemvNeonUKernel();
+#endif
+
 // Returns the selected FP16 HGEMM ukernel based on runtime CPU capabilities.
 const KaiF16HgemmKernel& GetKleidiAIHgemmUKernel();

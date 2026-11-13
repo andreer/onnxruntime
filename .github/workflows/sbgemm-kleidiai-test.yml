@@ -1,0 +1,92 @@
+# Experimental: builds the KleidiAI NEON SBGEMM change on Arm64 runners with BF16, runs the SBGEMM MLAS tests, the
+# fast-math operator tests and the full MLAS suite, and benchmarks SBGEMM for the change against the parent commit
+# (stock). Not part of any pull request.
+name: SBGEMM KleidiAI NEON test
+
+on:
+  push:
+    branches: [ci-test-change2]
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-15-xlarge]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: CPU
+        run: |
+          mkdir -p out
+          if [ "$(uname)" = Darwin ]; then
+            sysctl machdep.cpu.brand_string hw.ncpu hw.memsize hw.optional.arm.FEAT_BF16 hw.optional.arm.FEAT_SME \
+              hw.optional.arm.FEAT_SME2 2>&1 | tee out/cpu.txt
+          else
+            { lscpu; grep -m1 Features /proc/cpuinfo; nproc; free -g; } 2>&1 | tee out/cpu.txt
+          fi
+
+      - name: Tools
+        run: python -m pip install cmake ninja
+
+      - name: Configure
+        run: |
+          python tools/ci_build/build.py --build_dir build --config Release --parallel --skip_tests \
+            --skip_submodule_sync --cmake_generator Ninja --compile_no_warning_as_error \
+            --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=ON onnxruntime_BUILD_BENCHMARKS=ON --update \
+            > out/configure.log 2>&1 || { tail -50 out/configure.log; exit 1; }
+
+      - name: Build the change
+        run: |
+          cmake --build build/Release --parallel --target onnxruntime_mlas_test onnxruntime_provider_test \
+            onnxruntime_mlas_benchmark > out/build-change.log 2>&1 || { grep -m20 -E 'error' out/build-change.log; exit 1; }
+          grep -c -E 'warning:.*(kleidiai/|platform.cpp|matmul_fastmath_test|bench_sbgemm)' out/build-change.log || true
+          mkdir -p bin/change
+          cp build/Release/onnxruntime_mlas_test build/Release/onnxruntime_provider_test \
+            build/Release/onnxruntime_mlas_benchmark bin/change/
+
+      - name: Tests
+        run: |
+          rc=0
+          (cd bin/change && ./onnxruntime_mlas_test --gtest_filter='SBGemm*') > out/mlas-sbgemm.log 2>&1 || rc=1
+          (cd bin/change && ./onnxruntime_provider_test \
+            --gtest_filter='MathOpTest.*FastMath*:MathOpTest.MatMul*:Einsum.BFloat16*') > out/op.log 2>&1 || rc=1
+          (cd bin/change && ./onnxruntime_mlas_test) > out/mlas-full.log 2>&1 || rc=1
+          grep -h -E '^\[  (PASSED|FAILED)  \] [0-9]+ test' out/mlas-sbgemm.log out/op.log out/mlas-full.log
+          echo "$rc" > out/tests-rc.txt
+
+      - name: Build stock benchmark (parent commit)
+        run: |
+          git checkout HEAD~1 -- onnxruntime/core/mlas/lib/kleidiai/sbgemm_kleidiai.cpp \
+            onnxruntime/core/mlas/lib/kleidiai/kai_ukernel_interface.cpp \
+            onnxruntime/core/mlas/lib/kleidiai/kai_ukernel_interface.h onnxruntime/core/mlas/lib/platform.cpp
+          cmake --build build/Release --parallel --target onnxruntime_mlas_benchmark > out/build-stock.log 2>&1 \
+            || { grep -m20 -E 'error' out/build-stock.log; exit 1; }
+          mkdir -p bin/stock && cp build/Release/onnxruntime_mlas_benchmark bin/stock/
+
+      - name: Benchmark
+        run: |
+          for v in stock change; do
+            bin/$v/onnxruntime_mlas_benchmark --benchmark_filter='SBGEMM/' --benchmark_min_time=0.1s \
+              --benchmark_repetitions=3 --benchmark_report_aggregates_only=true --benchmark_format=json \
+              --benchmark_out=out/bench-$v.json > out/bench-$v.log 2>&1
+            echo "bench $v rc=$?"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbgemm-${{ matrix.runner }}
+          path: out/
+
+      - name: Fail if tests failed
+        run: test "$(cat out/tests-rc.txt)" = 0

@@ -318,6 +318,83 @@ TEST(MathOpTest, MatMulFloatTypeFastMathRuntimeBDeepK) {
   }
 }
 
+// Runs a fast-math MatMul on 8 intra-op threads and compares every output element exactly. A is [batch, M, K] and B is
+// [batch, K, N], without the batch dimension when batch is 1. Inputs are small integers, exact in bf16.
+static void RunFastMathMatMulExact(int64_t batch, int64_t M, int64_t K, int64_t N, bool b_is_initializer) {
+  SCOPED_TRACE("batch=" + std::to_string(batch) + " M=" + std::to_string(M) + " K=" + std::to_string(K) +
+               " N=" + std::to_string(N) + " b_is_initializer=" + std::to_string(b_is_initializer));
+  std::mt19937 rng(42);
+  auto small_int = [&rng]() { return static_cast<float>(static_cast<int>(rng() % 5) - 2); };
+  std::vector<float> a(batch * M * K), b(batch * K * N), expected(batch * M * N, 0.0f);
+  std::generate(a.begin(), a.end(), small_int);
+  std::generate(b.begin(), b.end(), small_int);
+  for (int64_t bi = 0; bi < batch; ++bi) {
+    for (int64_t i = 0; i < M; ++i) {
+      for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+          expected[(bi * M + i) * N + n] += a[(bi * M + i) * K + k] * b[(bi * K + k) * N + n];
+        }
+      }
+    }
+  }
+  auto dims = [batch](int64_t rows, int64_t cols) {
+    return batch == 1 ? std::vector<int64_t>{rows, cols} : std::vector<int64_t>{batch, rows, cols};
+  };
+
+  OpTester test("MatMul", 13);
+  test.AddInput<float>("A", dims(M, K), a);
+  test.AddInput<float>("B", dims(K, N), b, b_is_initializer);
+  test.AddOutput<float>("Y", dims(M, N), expected);
+
+  SessionOptions so;
+  ASSERT_STATUS_OK(so.config_options.AddConfigEntry(kOrtSessionOptionsMlasGemmFastMathArm64Bfloat16, "1"));
+  so.intra_op_param.thread_pool_size = 8;
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCpuExecutionProvider());
+  test.ConfigEps(std::move(execution_providers))
+      .Config(so)
+      .RunWithConfig();
+}
+
+// Large enough for the work to be split into tiles on 8 threads: across columns, and across both rows and columns
+// when there are few column blocks. K = 97 is not a multiple of the kernels' K block.
+TEST(MathOpTest, MatMulFloatTypeFastMathThreadedRuntimeB) {
+  RunFastMathMatMulExact(1, 64, 96, 600, false);
+  RunFastMathMatMulExact(1, 512, 96, 24, false);
+  RunFastMathMatMulExact(1, 64, 97, 600, false);
+}
+
+TEST(MathOpTest, MatMulFloatTypeFastMathThreadedInitializerB) {
+  RunFastMathMatMulExact(1, 64, 96, 600, true);
+  // A single block of rows, so the work is split across columns of a prepacked B.
+  RunFastMathMatMulExact(1, 8, 96, 600, true);
+  // Two blocks of rows, so the work is split across both rows and columns.
+  RunFastMathMatMulExact(1, 16, 96, 600, true);
+  RunFastMathMatMulExact(1, 16, 99, 600, true);
+}
+
+// A single row with a constant B, over several column tiles with a ragged last one, on one thread and split over
+// several.
+TEST(MathOpTest, MatMulFloatTypeFastMathSingleRowInitializerB) {
+  RunFastMathMatMulExact(1, 1, 96, 100, true);
+  RunFastMathMatMulExact(1, 1, 256, 1200, true);
+}
+
+// Few columns, which are left to MLAS (8, 14) or handled with a partial kernel block (10).
+TEST(MathOpTest, MatMulFloatTypeFastMathNarrowN) {
+  RunFastMathMatMulExact(1, 64, 96, 8, true);
+  RunFastMathMatMulExact(1, 64, 96, 14, true);
+  RunFastMathMatMulExact(1, 64, 96, 10, true);
+  RunFastMathMatMulExact(1, 64, 96, 10, false);
+  RunFastMathMatMulExact(1, 64, 96, 14, false);
+}
+
+// A batch of independent products with a non-constant B.
+TEST(MathOpTest, MatMulFloatTypeFastMathBatchedRuntimeB) {
+  RunFastMathMatMulExact(4, 64, 96, 40, false);
+}
+
 TEST(MathOpTest, MatMulFloatType_FastMath) {
   // TODO: Unskip when fixed #41968513
   if (DefaultDmlExecutionProvider().get() != nullptr) {
